@@ -249,11 +249,10 @@ bool seg6_encap_red_can_skip_srh(const struct ipv6_sr_hdr *srh)
 }
 EXPORT_SYMBOL_GPL(seg6_encap_red_can_skip_srh);
 
-/* encapsulate an IPv6 packet within an outer IPv6 header with reduced SRH */
-static int seg6_do_srh_encap_red(struct sk_buff *skb,
-				 struct ipv6_sr_hdr *osrh, int proto,
-				 struct dst_entry *cache_dst,
-				 struct in6_addr *route_tunsrc)
+static int __seg6_do_srh_encap_red(struct sk_buff *skb,
+				   struct ipv6_sr_hdr *osrh, int proto,
+				   struct dst_entry *cache_dst,
+				   struct in6_addr *route_tunsrc)
 {
 	__u8 first_seg = osrh->first_segment;
 	struct dst_entry *dst = skb_dst(skb);
@@ -366,6 +365,14 @@ out:
 	return 0;
 }
 
+/* encapsulate an IPv6 packet within an outer IPv6 header with a reduced SRH */
+int seg6_do_srh_encap_red(struct sk_buff *skb, struct ipv6_sr_hdr *osrh,
+			  int proto)
+{
+	return __seg6_do_srh_encap_red(skb, osrh, proto, NULL, NULL);
+}
+EXPORT_SYMBOL_GPL(seg6_do_srh_encap_red);
+
 static int __seg6_do_srh_inline(struct sk_buff *skb, struct ipv6_sr_hdr *osrh,
 				struct dst_entry *cache_dst)
 {
@@ -455,8 +462,8 @@ static int seg6_do_srh(struct sk_buff *skb, struct dst_entry *cache_dst)
 			err = __seg6_do_srh_encap(skb, tinfo->srh, proto,
 						  cache_dst, &slwt->tunsrc);
 		else
-			err = seg6_do_srh_encap_red(skb, tinfo->srh, proto,
-						    cache_dst, &slwt->tunsrc);
+			err = __seg6_do_srh_encap_red(skb, tinfo->srh, proto,
+						      cache_dst, &slwt->tunsrc);
 
 		if (err)
 			return err;
@@ -481,9 +488,10 @@ static int seg6_do_srh(struct sk_buff *skb, struct dst_entry *cache_dst)
 						  IPPROTO_ETHERNET, cache_dst,
 						  &slwt->tunsrc);
 		else
-			err = seg6_do_srh_encap_red(skb, tinfo->srh,
-						    IPPROTO_ETHERNET, cache_dst,
-						    &slwt->tunsrc);
+			err = __seg6_do_srh_encap_red(skb, tinfo->srh,
+						      IPPROTO_ETHERNET,
+						      cache_dst,
+						      &slwt->tunsrc);
 
 		if (err)
 			return err;

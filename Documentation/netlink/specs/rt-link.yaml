@@ -845,6 +845,14 @@ definitions:
       - p2p
       - mp
   -
+    name: sr6-encap-mode
+    enum-name: sr6-encap-mode
+    name-prefix: sr6-encap-mode
+    type: enum
+    entries:
+      - full
+      - reduced
+  -
     name: br-stp-mode
     type: enum
     enum-name: br-stp-mode
@@ -2359,6 +2367,20 @@ attribute-sets:
         name: mode
         type: u8
         enum: ovpn-mode
+  -
+    name: linkinfo-sr6-attrs
+    name-prefix: ifla-sr6-
+    attributes:
+      -
+        name: srh
+        type: binary
+      -
+        name: fib-table
+        type: u32
+      -
+        name: encap-mode
+        type: u8
+        enum: sr6-encap-mode
 
 sub-messages:
   -
@@ -2418,6 +2440,9 @@ sub-messages:
       -
         value: ovpn
         attribute-set: linkinfo-ovpn-attrs
+      -
+        value: sr6
+        attribute-set: linkinfo-sr6-attrs
   -
     name: linkinfo-member-data-msg
     formats:

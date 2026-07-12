@@ -2074,4 +2074,24 @@ enum {
 
 #define IFLA_OVPN_MAX	(__IFLA_OVPN_MAX - 1)
 
+/* SR6 section */
+
+enum sr6_encap_mode {
+	SR6_ENCAP_MODE_FULL,
+	SR6_ENCAP_MODE_REDUCED,
+	__SR6_ENCAP_MODE_MAX,
+};
+
+#define SR6_ENCAP_MODE_MAX (__SR6_ENCAP_MODE_MAX - 1)
+
+enum {
+	IFLA_SR6_UNSPEC,
+	IFLA_SR6_SRH,
+	IFLA_SR6_FIB_TABLE,
+	IFLA_SR6_ENCAP_MODE,
+	__IFLA_SR6_MAX,
+};
+
+#define IFLA_SR6_MAX (__IFLA_SR6_MAX - 1)
+
 #endif /* _UAPI_LINUX_IF_LINK_H */
