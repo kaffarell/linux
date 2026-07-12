@@ -110,6 +110,7 @@ Contents:
    seg6-sysctl
    skbuff
    smc-sysctl
+   sr6
    sriov
    statistics
    strparser
