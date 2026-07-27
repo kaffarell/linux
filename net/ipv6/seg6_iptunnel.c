@@ -221,6 +221,34 @@ int seg6_do_srh_encap(struct sk_buff *skb, struct ipv6_sr_hdr *osrh, int proto)
 }
 EXPORT_SYMBOL_GPL(seg6_do_srh_encap);
 
+/* Return true when the reduced encapsulation can skip the SRH, false otherwise.
+ * The reduced encapsulation copies the first SID into the destination address
+ * of the outer header, so the SRH can be skipped when it carries a single SID
+ * and no other info.
+ */
+bool seg6_encap_red_can_skip_srh(const struct ipv6_sr_hdr *srh)
+{
+	int tlv_offset;
+
+	/* there are still segments to visit */
+	if (srh->segments_left)
+		return false;
+
+	/* the SID list holds more than one SID */
+	if (srh->first_segment)
+		return false;
+
+	/* flags, HMAC included, and tag must be preserved */
+	if (srh->flags || srh->tag)
+		return false;
+
+	/* TLVs, if any, would start right after the single SID */
+	tlv_offset = sizeof(*srh) + sizeof(struct in6_addr);
+
+	return tlv_offset == ipv6_optlen(srh);
+}
+EXPORT_SYMBOL_GPL(seg6_encap_red_can_skip_srh);
+
 /* encapsulate an IPv6 packet within an outer IPv6 header with reduced SRH */
 static int seg6_do_srh_encap_red(struct sk_buff *skb,
 				 struct ipv6_sr_hdr *osrh, int proto,
@@ -244,11 +272,7 @@ static int seg6_do_srh_encap_red(struct sk_buff *skb,
 	if (first_seg > 0) {
 		red_hdrlen = hdrlen - sizeof(struct in6_addr);
 	} else {
-		/* NOTE: if tag/flags and/or other TLVs are introduced in the
-		 * seg6_iptunnel infrastructure, they should be considered when
-		 * deciding to skip the SRH.
-		 */
-		skip_srh = !sr_has_hmac(osrh);
+		skip_srh = seg6_encap_red_can_skip_srh(osrh);
 
 		red_hdrlen = skip_srh ? 0 : hdrlen;
 	}
