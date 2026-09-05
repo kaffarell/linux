@@ -32,13 +32,17 @@
  */
 #define SRL2_SRH_HEADROOM_EST	256
 
-struct srl2_priv {
+struct srl2_rdst {
 	struct ipv6_sr_hdr	*srh;
 	struct dst_cache	dst_cache;
 };
 
+struct srl2_priv {
+	struct srl2_rdst default_dst;
+};
+
 /*
- * srl2_xmit - encapsulate an L2 frame in IPv6+SRH and transmit
+ * srl2_xmit_one - encapsulate an L2 frame in IPv6+SRH and transmit
  *
  * When the bridge (or local stack) sends a frame through this device,
  * skb->data points to the inner Ethernet header.  We look up a route
@@ -46,24 +50,24 @@ struct srl2_priv {
  * seg6_do_srh_encap(), and transmit via ip6tunnel_xmit().
  *
  * The route lookup result is cached per-cpu in dst_cache. Since the
- * first SID is constant for the lifetime of the device, the cache
+ * first SID is constant for the lifetime of the policy, the cache
  * avoids repeated route lookups in the common case.
  */
-static netdev_tx_t srl2_xmit(struct sk_buff *skb, struct net_device *dev)
+static netdev_tx_t srl2_xmit_one(struct sk_buff *skb, struct net_device *dev,
+				   struct srl2_rdst *rdst)
 {
-	struct srl2_priv *priv = netdev_priv(dev);
 	struct net *net = dev_net(dev);
 	struct dst_entry *dst;
 	struct flowi6 fl6;
 	int err;
 
 	local_bh_disable();
-	dst = dst_cache_get(&priv->dst_cache);
+	dst = dst_cache_get(&rdst->dst_cache);
 	local_bh_enable();
 
 	if (unlikely(!dst)) {
 		memset(&fl6, 0, sizeof(fl6));
-		fl6.daddr = priv->srh->segments[priv->srh->first_segment];
+		fl6.daddr = rdst->srh->segments[rdst->srh->first_segment];
 
 		dst = ip6_route_output(net, NULL, &fl6);
 		if (dst->error) {
@@ -80,7 +84,7 @@ static netdev_tx_t srl2_xmit(struct sk_buff *skb, struct net_device *dev)
 
 		local_bh_disable();
 		/* saddr is unused */
-		dst_cache_set_ip6(&priv->dst_cache, dst, &fl6.saddr);
+		dst_cache_set_ip6(&rdst->dst_cache, dst, &fl6.saddr);
 		local_bh_enable();
 	}
 
@@ -88,7 +92,7 @@ static netdev_tx_t srl2_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	skb_dst_set(skb, dst);
 
-	err = seg6_do_srh_encap(skb, priv->srh, IPPROTO_ETHERNET);
+	err = seg6_do_srh_encap(skb, rdst->srh, IPPROTO_ETHERNET);
 	if (unlikely(err)) {
 		DEV_STATS_INC(dev, tx_errors);
 		kfree_skb(skb);
@@ -107,25 +111,32 @@ drop:
 	return NETDEV_TX_OK;
 }
 
+static netdev_tx_t srl2_xmit(struct sk_buff *skb, struct net_device *dev)
+{
+	struct srl2_priv *priv = netdev_priv(dev);
+
+	return srl2_xmit_one(skb, dev, &priv->default_dst);
+}
+
 static int srl2_dev_init(struct net_device *dev)
 {
 	struct srl2_priv *priv = netdev_priv(dev);
 
-	return dst_cache_init(&priv->dst_cache, GFP_KERNEL);
+	return dst_cache_init(&priv->default_dst.dst_cache, GFP_KERNEL);
 }
 
 static void srl2_dev_uninit(struct net_device *dev)
 {
 	struct srl2_priv *priv = netdev_priv(dev);
 
-	dst_cache_destroy(&priv->dst_cache);
+	dst_cache_destroy(&priv->default_dst.dst_cache);
 }
 
 static void srl2_dev_free(struct net_device *dev)
 {
 	struct srl2_priv *priv = netdev_priv(dev);
 
-	kfree(priv->srh);
+	kfree(priv->default_dst.srh);
 }
 
 static const struct net_device_ops srl2_netdev_ops = {
@@ -191,8 +202,8 @@ static int srl2_newlink(struct net_device *dev,
 		return -EINVAL;
 	}
 
-	priv->srh = kmemdup(srh, len, GFP_KERNEL);
-	if (!priv->srh)
+	priv->default_dst.srh = kmemdup(srh, len, GFP_KERNEL);
+	if (!priv->default_dst.srh)
 		return -ENOMEM;
 
 	srhlen = ipv6_optlen(srh);
@@ -220,7 +231,7 @@ static void srl2_dellink(struct net_device *dev, struct list_head *head)
 static size_t srl2_get_size(const struct net_device *dev)
 {
 	const struct srl2_priv *priv = netdev_priv(dev);
-	int srhlen = ipv6_optlen(priv->srh);
+	int srhlen = ipv6_optlen(priv->default_dst.srh);
 
 	return nla_total_size(srhlen);
 }
@@ -228,9 +239,9 @@ static size_t srl2_get_size(const struct net_device *dev)
 static int srl2_fill_info(struct sk_buff *skb, const struct net_device *dev)
 {
 	const struct srl2_priv *priv = netdev_priv(dev);
-	int srhlen = ipv6_optlen(priv->srh);
+	int srhlen = ipv6_optlen(priv->default_dst.srh);
 
-	if (nla_put(skb, IFLA_SRL2_SRH, srhlen, priv->srh))
+	if (nla_put(skb, IFLA_SRL2_SRH, srhlen, priv->default_dst.srh))
 		return -EMSGSIZE;
 
 	return 0;
