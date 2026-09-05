@@ -108,6 +108,7 @@ Contents:
    sctp
    secid
    seg6-sysctl
+   srl2
    skbuff
    smc-sysctl
    sriov
