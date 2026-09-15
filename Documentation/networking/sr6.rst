@@ -121,6 +121,9 @@ old entry after a grace period.
   creation when the MAC is absent. Every add/replace requires an SRH.
 * Delete takes a MAC and optionally an SRH. An SRH-qualified delete must
   match the installed policy exactly.
+* RTM_DELNEIGH with NLM_F_BULK flushes the table. NDA_NDM_STATE_MASK
+  restricts the flush to entries whose masked state matches ndm_state;
+  other filters are rejected as unsupported.
 * RTM_GETNEIGH supports individual get and multipart dump. Responses and
   RTNLGRP_NEIGH add/replace/delete notifications include the SRH, MAC,
   state, ifindex and NTF_SELF.
@@ -143,9 +146,10 @@ policy's dst_cache through the standard IPv6 route-cookie checks. Changes
 to the device's master hierarchy reset all policy caches, including when
 its bridge moves between VRFs.
 
-Device teardown removes all entries. RCU callbacks own all remaining
-policy resources without referencing the device. Module exit waits for
-these callbacks before unloading their code.
+Device teardown removes all entries and notifies each removal, so a
+listener tracking policies never retains stale entries. RCU callbacks own
+all remaining policy resources without referencing the device. Module exit
+waits for these callbacks before unloading their code.
 
 Encapsulation mode
 ~~~~~~~~~~~~~~~~~~
