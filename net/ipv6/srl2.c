@@ -263,8 +263,11 @@ free:
 	return err;
 }
 
-static void srl2_fdb_remove(struct srl2_priv *priv, struct srl2_fdb *fdb)
+static void srl2_fdb_remove(struct net_device *dev, struct srl2_fdb *fdb)
 {
+	struct srl2_priv *priv = netdev_priv(dev);
+
+	srl2_fdb_notify(dev, fdb, RTM_DELNEIGH);
 	rhashtable_remove_fast(&priv->fdb, &fdb->rhnode, srl2_fdb_rht_params);
 	list_del_rcu(&fdb->list);
 	call_rcu(&fdb->rcu, srl2_fdb_free_rcu);
@@ -298,9 +301,52 @@ static int srl2_fdb_del(struct ndmsg *ndm, struct nlattr *tb[],
 		    ipv6_optlen(fdb->remote.srh))))
 		return -ENOENT;
 
-	srl2_fdb_notify(dev, fdb, RTM_DELNEIGH);
-	srl2_fdb_remove(priv, fdb);
+	srl2_fdb_remove(dev, fdb);
 	*notified = true;
+	return 0;
+}
+
+/* Entries carry no per-entry NTF flags. Once a nonzero ndm_flags filter has
+ * been rejected as unsupported, NDA_NDM_FLAGS_MASK therefore selects the
+ * entries whose requested flag bits are clear, which is all of them.
+ */
+static const struct nla_policy srl2_del_bulk_policy[NDA_MAX + 1] = {
+	[NDA_NDM_STATE_MASK]	= { .type = NLA_U16 },
+	[NDA_NDM_FLAGS_MASK]	= { .type = NLA_U8 },
+};
+
+static int srl2_fdb_del_bulk(struct nlmsghdr *nlh, struct net_device *dev,
+			     struct netlink_ext_ack *extack)
+{
+	struct srl2_priv *priv = netdev_priv(dev);
+	struct ndmsg *ndm = nlmsg_data(nlh);
+	struct nlattr *tb[NDA_MAX + 1];
+	struct srl2_fdb *fdb, *tmp;
+	u16 state_mask = 0;
+	int err;
+
+	ASSERT_RTNL();
+	err = nlmsg_parse(nlh, sizeof(*ndm), tb, NDA_MAX, srl2_del_bulk_policy,
+			  extack);
+	if (err)
+		return err;
+	/* NTF_MASTER and NTF_SELF select the table, they do not filter it. */
+	if (ndm->ndm_flags & ~(NTF_MASTER | NTF_SELF)) {
+		NL_SET_ERR_MSG(extack, "Unsupported srl2 FDB flush flags");
+		return -EOPNOTSUPP;
+	}
+	if (ndm->ndm_state & ~(NUD_PERMANENT | NUD_REACHABLE | NUD_NOARP)) {
+		NL_SET_ERR_MSG(extack, "Unsupported srl2 FDB flush state");
+		return -EINVAL;
+	}
+	if (tb[NDA_NDM_STATE_MASK])
+		state_mask = nla_get_u16(tb[NDA_NDM_STATE_MASK]);
+
+	list_for_each_entry_safe(fdb, tmp, &priv->fdb_list, list) {
+		if (state_mask && (fdb->state & state_mask) != ndm->ndm_state)
+			continue;
+		srl2_fdb_remove(dev, fdb);
+	}
 	return 0;
 }
 
@@ -464,7 +510,7 @@ static void srl2_dev_uninit(struct net_device *dev)
 	struct srl2_fdb *fdb, *tmp;
 
 	list_for_each_entry_safe(fdb, tmp, &priv->fdb_list, list)
-		srl2_fdb_remove(priv, fdb);
+		srl2_fdb_remove(dev, fdb);
 	rhashtable_destroy(&priv->fdb);
 	dst_cache_destroy(&priv->default_dst.dst_cache);
 }
@@ -483,6 +529,7 @@ static const struct net_device_ops srl2_netdev_ops = {
 	.ndo_start_xmit		= srl2_xmit,
 	.ndo_fdb_add		= srl2_fdb_add,
 	.ndo_fdb_del		= srl2_fdb_del,
+	.ndo_fdb_del_bulk	= srl2_fdb_del_bulk,
 	.ndo_fdb_dump		= srl2_fdb_dump,
 	.ndo_fdb_get		= srl2_fdb_get,
 	.ndo_set_mac_address	= eth_mac_addr,
