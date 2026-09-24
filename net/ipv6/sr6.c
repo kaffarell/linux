@@ -36,9 +36,13 @@
  */
 #define SR6_SRH_HEADROOM_EST	256
 
-struct sr6_priv {
+struct sr6_rdst {
 	struct ipv6_sr_hdr	*srh;
 	struct dst_cache	dst_cache;
+};
+
+struct sr6_priv {
+	struct sr6_rdst		default_dst;
 	u32			fib_table;
 	u8			encap_mode;
 };
@@ -155,23 +159,23 @@ static struct dst_entry *sr6_dst_lookup(struct net *net,
  * Every other error is the dst->error of the lookup, such as -ENETUNREACH
  * when there is no route.
  */
-static struct dst_entry *sr6_route_lookup(struct net_device *dev)
+static struct dst_entry *sr6_route_lookup(struct net_device *dev,
+					  struct sr6_rdst *rdst)
 {
-	struct sr6_priv *priv = netdev_priv(dev);
 	struct net *net = dev_net(dev);
 	struct dst_entry *dst;
 	struct flowi6 fl6;
 	int err;
 
 	local_bh_disable();
-	dst = dst_cache_get(&priv->dst_cache);
+	dst = dst_cache_get(&rdst->dst_cache);
 	local_bh_enable();
 
 	if (likely(dst))
 		return dst;
 
 	memset(&fl6, 0, sizeof(fl6));
-	fl6.daddr = priv->srh->segments[priv->srh->first_segment];
+	fl6.daddr = rdst->srh->segments[rdst->srh->first_segment];
 
 	dst = sr6_dst_lookup(net, dev, &fl6);
 	if (dst->error) {
@@ -185,7 +189,7 @@ static struct dst_entry *sr6_route_lookup(struct net_device *dev)
 	}
 
 	local_bh_disable();
-	dst_cache_set_ip6(&priv->dst_cache, dst, &fl6.saddr);
+	dst_cache_set_ip6(&rdst->dst_cache, dst, &fl6.saddr);
 	local_bh_enable();
 
 	return dst;
@@ -196,14 +200,15 @@ release_dst:
 }
 
 /*
- * sr6_xmit - encapsulate an L2 frame in IPv6+SRH and transmit
+ * sr6_xmit_one - encapsulate an L2 frame in IPv6+SRH and transmit
  *
  * When the bridge (or local stack) sends a frame through this device, skb->data
  * points to the inner Ethernet header. We look up a route towards the first
  * SID, prepend the outer IPv6+SRH via seg6_do_srh_encap(), and transmit via
- * sr6_tunnel_xmit(). The route lookup result is cached per-cpu.
+ * sr6_tunnel_xmit(). The route lookup result is cached per-cpu, per policy.
  */
-static netdev_tx_t sr6_xmit(struct sk_buff *skb, struct net_device *dev)
+static netdev_tx_t sr6_xmit_one(struct sk_buff *skb, struct net_device *dev,
+				struct sr6_rdst *rdst)
 {
 	struct sr6_priv *priv = netdev_priv(dev);
 	enum skb_drop_reason reason;
@@ -217,7 +222,7 @@ static netdev_tx_t sr6_xmit(struct sk_buff *skb, struct net_device *dev)
 	if (unlikely(reason))
 		goto drop;
 
-	dst = sr6_route_lookup(dev);
+	dst = sr6_route_lookup(dev, rdst);
 	if (unlikely(IS_ERR(dst))) {
 		/* A missing FIB table is a configuration error, not a routing
 		 * one, so it takes no specific counter: tx_errors alone.
@@ -240,9 +245,9 @@ static netdev_tx_t sr6_xmit(struct sk_buff *skb, struct net_device *dev)
 	pkt_len = skb->len;
 
 	if (priv->encap_mode == SR6_ENCAP_MODE_REDUCED)
-		err = seg6_do_srh_encap_red(skb, priv->srh, IPPROTO_ETHERNET);
+		err = seg6_do_srh_encap_red(skb, rdst->srh, IPPROTO_ETHERNET);
 	else
-		err = seg6_do_srh_encap(skb, priv->srh, IPPROTO_ETHERNET);
+		err = seg6_do_srh_encap(skb, rdst->srh, IPPROTO_ETHERNET);
 
 	if (unlikely(err)) {
 		DEV_STATS_INC(dev, tx_errors);
@@ -264,11 +269,18 @@ free_skb:
 	return NETDEV_TX_OK;
 }
 
+static netdev_tx_t sr6_xmit(struct sk_buff *skb, struct net_device *dev)
+{
+	struct sr6_priv *priv = netdev_priv(dev);
+
+	return sr6_xmit_one(skb, dev, &priv->default_dst);
+}
+
 static int sr6_dev_init(struct net_device *dev)
 {
 	struct sr6_priv *priv = netdev_priv(dev);
 
-	return dst_cache_init(&priv->dst_cache, GFP_KERNEL);
+	return dst_cache_init(&priv->default_dst.dst_cache, GFP_KERNEL);
 }
 
 /* Free resources allocated in sr6_newlink(). Shared between the error path in
@@ -277,15 +289,15 @@ static int sr6_dev_init(struct net_device *dev)
  */
 static void sr6_free_newlink_resources(struct sr6_priv *priv)
 {
-	kfree(priv->srh);
-	priv->srh = NULL;
+	kfree(priv->default_dst.srh);
+	priv->default_dst.srh = NULL;
 }
 
 static void sr6_dev_uninit(struct net_device *dev)
 {
 	struct sr6_priv *priv = netdev_priv(dev);
 
-	dst_cache_destroy(&priv->dst_cache);
+	dst_cache_destroy(&priv->default_dst.dst_cache);
 	sr6_free_newlink_resources(priv);
 }
 
@@ -400,8 +412,8 @@ static int sr6_newlink(struct net_device *dev,
 		return -EINVAL;
 	}
 
-	priv->srh = kmemdup(srh, len, GFP_KERNEL);
-	if (!priv->srh)
+	priv->default_dst.srh = kmemdup(srh, len, GFP_KERNEL);
+	if (!priv->default_dst.srh)
 		return -ENOMEM;
 
 	/* already validated by the nla policy */
@@ -443,7 +455,7 @@ static void sr6_dellink(struct net_device *dev, struct list_head *head)
 static size_t sr6_get_size(const struct net_device *dev)
 {
 	const struct sr6_priv *priv = netdev_priv(dev);
-	int srhlen = ipv6_optlen(priv->srh);
+	int srhlen = ipv6_optlen(priv->default_dst.srh);
 
 	return nla_total_size(srhlen)	/* IFLA_SR6_SRH */
 	       + nla_total_size(4)	/* IFLA_SR6_FIB_TABLE */
@@ -453,9 +465,9 @@ static size_t sr6_get_size(const struct net_device *dev)
 static int sr6_fill_info(struct sk_buff *skb, const struct net_device *dev)
 {
 	const struct sr6_priv *priv = netdev_priv(dev);
-	int srhlen = ipv6_optlen(priv->srh);
+	int srhlen = ipv6_optlen(priv->default_dst.srh);
 
-	if (nla_put(skb, IFLA_SR6_SRH, srhlen, priv->srh))
+	if (nla_put(skb, IFLA_SR6_SRH, srhlen, priv->default_dst.srh))
 		return -EMSGSIZE;
 
 	if (priv->fib_table &&
@@ -490,7 +502,7 @@ static int sr6_reset_dst_cache(struct net_device *dev,
 		return 0;
 
 	sp = netdev_priv(dev);
-	dst_cache_reset(&sp->dst_cache);
+	dst_cache_reset(&sp->default_dst.dst_cache);
 
 	return 0;
 }
