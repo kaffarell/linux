@@ -1116,8 +1116,8 @@ device_creation_error_tests()
 		return
 	fi
 
-	! ip -netns "${tns}" link add sr6-bad type sr6 mode full 2>/dev/null
-	log_test $? 0 "Reject sr6 without segs"
+	# SRH-free FDB devices are tested via raw rtnetlink in sr6_fdb.py;
+	# iproute2 versions may still require a default segment list.
 
 	! ip -netns "${tns}" link add sr6-bad type sr6 segs fc00::1 2>/dev/null
 	log_test $? 0 "Reject sr6 without encap mode"
