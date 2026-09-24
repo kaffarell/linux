@@ -34,6 +34,7 @@ enum {
 	NDA_FLAGS_EXT,
 	NDA_NDM_STATE_MASK,
 	NDA_NDM_FLAGS_MASK,
+	NDA_SR6_SRH,	/* binary: struct ipv6_sr_hdr + full segment list */
 	__NDA_MAX
 };
 

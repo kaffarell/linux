@@ -8,7 +8,8 @@ The sr6 device is a virtual Ethernet tunnel device that encapsulates L2
 frames in IPv6 with a Segment Routing Header (SRH) for transmission over
 an SRv6 network. It is designed for use with a remote seg6local L2
 decapsulation behavior such as End.DT2U or End.DX2, providing
-point-to-point L2 VPN services over an IPv6 backbone.
+point-to-point and statically configured multipoint L2 VPN services over
+an IPv6 backbone.
 
 The End.DT2U and End.DX2 behaviors are defined in RFC 8986 (SRv6 Network
 Programming).
@@ -85,6 +86,66 @@ including IPv4, IPv6, ARP, and other L2 protocols. The hosts are
 unaware of the encapsulation. The underlay is the IPv6 operator network
 that interconnects the PE routers and carries the SRv6-encapsulated
 traffic.
+
+Static unicast FDB
+~~~~~~~~~~~~~~~~~~
+
+An sr6 device can select a different SRv6 policy for each destination MAC.
+The interface-level ``IFLA_SR6_SRH`` attribute is an optional default
+policy: existing point-to-point configurations retain their behavior,
+while a device without it operates solely on its private FDB. The
+encapsulation mode remains mandatory, even without a default SRH.
+
+Use RTM_NEWNEIGH / RTM_DELNEIGH with AF_BRIDGE, the sr6 ifindex and
+NTF_SELF. NDA_LLADDR identifies a nonzero unicast Ethernet destination.
+NDA_SR6_SRH carries the same binary ``struct ipv6_sr_hdr`` and full segment
+array as IFLA_SR6_SRH, including any validated SRH TLVs. Segment zero is
+the final SID; ``first_segment`` identifies the initial active SID.
+The kernel validates and copies the entire attribute. Both encapsulation
+modes take the full SID list; reduced encoding is performed at transmit
+time, not by userspace.
+
+NDA_SR6_SRH is a device-specific neighbor attribute, analogous to NDA_DST
+for VXLAN, rather than an activity-control flag under NDA_FDB_EXT_ATTRS.
+This experimental UAPI needs upstream review before iproute2 syntax is
+established. ``tools/testing/selftests/net/sr6_fdb.py`` uses raw rtnetlink
+and does not require a modified iproute2.
+
+Each MAC has exactly one policy and an independent route cache. Writers
+are serialized by RTNL. Transmit lookup uses an RCU-protected rhashtable;
+replacement publishes a complete new entry and cache before retiring the
+old entry after a grace period.
+
+* NLM_F_CREATE | NLM_F_EXCL adds a new entry and rejects duplicates.
+* NLM_F_REPLACE replaces an existing entry; adding NLM_F_CREATE also allows
+  creation when the MAC is absent. Every add/replace requires an SRH.
+* Delete takes a MAC and optionally an SRH. An SRH-qualified delete must
+  match the installed policy exactly.
+* RTM_GETNEIGH supports individual get and multipart dump. Responses and
+  RTNLGRP_NEIGH add/replace/delete notifications include the SRH, MAC,
+  state, ifindex and NTF_SELF.
+
+Entries require NUD_PERMANENT or NUD_REACHABLE (optionally NUD_NOARP).
+They never age or learn. Other neighbor flags, VLAN keys, multicast/zero
+MACs, remote attributes and NLM_F_APPEND are unsupported.
+
+An exact destination-MAC match overrides the default policy. A miss,
+including broadcast or multicast, uses the interface-level policy if
+present, or increments tx_dropped otherwise. An exact match whose route
+lookup fails is dropped, not sent through the fallback. There is no flood
+list, replication, or dynamic remote learning. Pure FDB deployments must
+arrange neighbor resolution separately, for example using static overlay
+neighbors. Receive delivery continues to use End.DT2U.
+
+All policies use the device's encapsulation mode and routing context
+(explicit FIB table or inherited VRF). Route changes invalidate each
+policy's dst_cache through the standard IPv6 route-cookie checks. Changes
+to the device's master hierarchy reset all policy caches, including when
+its bridge moves between VRFs.
+
+Device teardown removes all entries. RCU callbacks own all remaining
+policy resources without referencing the device. Module exit waits for
+these callbacks before unloading their code.
 
 Encapsulation mode
 ~~~~~~~~~~~~~~~~~~
@@ -208,12 +269,25 @@ A long segment list drives the MTU down. Below the IPv6 minimum of 1280,
 IPv6 does not come up on the device, while IPv4 keeps working, and the
 computed default never goes under the Ethernet minimum of 68.
 
+Without a default SRH, the initial MTU reserves the overhead of a single
+SID for the selected mode (1422 for full, 1446 for reduced). FDB policies
+with larger encoded overhead increase needed_headroom and lower max_mtu.
+These limits are not relaxed after deletion. An installation that cannot
+accommodate the current MTU within the maximum outer packet size fails;
+lower the MTU first. FDB operations never silently change the current MTU.
+
+needed_headroom is only a hint: the encapsulation helpers expand each skb
+for its actual policy. Configure the inner MTU for the smallest underlay
+path MTU and largest encoded policy overhead to avoid outer fragmentation:
+the End.DT2U receive path does not reassemble outer fragments.
+
 Limitations
 ~~~~~~~~~~~
 
-The sr6 device configuration (segment list, table, encapsulation mode)
-is immutable after creation. To change the SRv6 path, the FIB table or
-the mode, the device must be deleted and recreated. The device also
+The sr6 device configuration (default segment list, table, encapsulation
+mode) is immutable after creation. To change the fallback SRv6 path, the
+FIB table or the mode, the device must be deleted and recreated. Per-MAC
+FDB policies can be added, replaced and deleted at runtime. The device
 cannot be moved between network namespaces.
 
 Usage

@@ -20,6 +20,7 @@
 #include <linux/module.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
+#include <linux/rhashtable.h>
 #include <net/dst_cache.h>
 #include <net/ip6_fib.h>
 #include <net/ip6_route.h>
@@ -43,6 +44,9 @@ struct sr6_rdst {
 
 struct sr6_priv {
 	struct sr6_rdst		default_dst;
+	struct rhashtable	fdb;
+	/* RTNL serializes writers; the list provides stable dump ordering. */
+	struct list_head	fdb_list;
 	u32			fib_table;
 	u8			encap_mode;
 };
@@ -63,6 +67,309 @@ static int sr6_encap_srhlen(const struct ipv6_sr_hdr *srh, u8 encap_mode)
 
 	/* the first SID is not repeated, unless it is the only one */
 	return srh->first_segment ? srhlen - sizeof(struct in6_addr) : srhlen;
+}
+
+struct sr6_fdb {
+	struct rhash_head rhnode;
+	struct list_head list;
+	struct rcu_head rcu;
+	u8 addr[ETH_ALEN];
+	u16 state;
+	struct sr6_rdst remote;
+};
+
+static const struct rhashtable_params sr6_fdb_rht_params = {
+	.head_offset = offsetof(struct sr6_fdb, rhnode),
+	.key_offset = offsetof(struct sr6_fdb, addr),
+	.key_len = ETH_ALEN,
+	.automatic_shrinking = true,
+};
+
+static struct sr6_fdb *sr6_fdb_lookup(struct sr6_priv *priv,
+				      const unsigned char *addr)
+{
+	return rhashtable_lookup_fast(&priv->fdb, addr, sr6_fdb_rht_params);
+}
+
+static int sr6_srh_validate(struct nlattr *attr,
+			    struct netlink_ext_ack *extack)
+{
+	struct ipv6_sr_hdr *srh;
+
+	if (!attr) {
+		NL_SET_ERR_MSG(extack, "SRH with segment list is required");
+		return -EINVAL;
+	}
+
+	srh = nla_data(attr);
+	if (nla_len(attr) < sizeof(*srh) + sizeof(struct in6_addr) ||
+	    !seg6_validate_srh(srh, nla_len(attr), false)) {
+		NL_SET_ERR_MSG_ATTR(extack, attr, "Invalid SRH");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static void sr6_fdb_free(struct sr6_fdb *fdb)
+{
+	dst_cache_destroy(&fdb->remote.dst_cache);
+	kfree(fdb->remote.srh);
+	kfree(fdb);
+}
+
+static void sr6_fdb_free_rcu(struct rcu_head *rcu)
+{
+	sr6_fdb_free(container_of(rcu, struct sr6_fdb, rcu));
+}
+
+static int sr6_fdb_info(struct sk_buff *skb, struct net_device *dev,
+			struct sr6_fdb *fdb, u32 portid, u32 seq,
+			int type, int flags)
+{
+	struct nlmsghdr *nlh;
+	struct ndmsg *ndm;
+
+	nlh = nlmsg_put(skb, portid, seq, type, sizeof(*ndm), flags);
+	if (!nlh)
+		return -EMSGSIZE;
+
+	ndm = nlmsg_data(nlh);
+	memset(ndm, 0, sizeof(*ndm));
+	ndm->ndm_family = AF_BRIDGE;
+	ndm->ndm_ifindex = dev->ifindex;
+	ndm->ndm_state = fdb->state;
+	ndm->ndm_flags = NTF_SELF;
+	ndm->ndm_type = RTN_UNICAST;
+
+	if (nla_put(skb, NDA_LLADDR, ETH_ALEN, fdb->addr) ||
+	    nla_put(skb, NDA_SR6_SRH, ipv6_optlen(fdb->remote.srh),
+		    fdb->remote.srh)) {
+		nlmsg_cancel(skb, nlh);
+		return -EMSGSIZE;
+	}
+
+	nlmsg_end(skb, nlh);
+	return 0;
+}
+
+static void sr6_fdb_notify(struct net_device *dev, struct sr6_fdb *fdb,
+			   int type)
+{
+	struct net *net = dev_net(dev);
+	struct sk_buff *skb;
+	int err = -ENOBUFS;
+	size_t size;
+
+	size = NLMSG_ALIGN(sizeof(struct ndmsg)) + nla_total_size(ETH_ALEN) +
+	       nla_total_size(ipv6_optlen(fdb->remote.srh));
+	skb = nlmsg_new(size, GFP_KERNEL);
+	if (!skb)
+		goto errout;
+
+	err = sr6_fdb_info(skb, dev, fdb, 0, 0, type, 0);
+	if (err) {
+		kfree_skb(skb);
+		goto errout;
+	}
+
+	rtnl_notify(skb, net, 0, RTNLGRP_NEIGH, NULL, GFP_KERNEL);
+	return;
+errout:
+	rtnl_set_sk_err(net, RTNLGRP_NEIGH, err);
+}
+
+static int sr6_fdb_validate(struct nlattr *tb[], const unsigned char *addr,
+			    u16 vid, struct netlink_ext_ack *extack)
+{
+	int i;
+
+	if (!is_valid_ether_addr(addr)) {
+		NL_SET_ERR_MSG(extack, "Only nonzero unicast MAC addresses are supported");
+		return -EINVAL;
+	}
+	if (vid) {
+		NL_SET_ERR_MSG(extack, "VLAN-qualified FDB entries are not supported");
+		return -EOPNOTSUPP;
+	}
+	for (i = 0; i <= NDA_MAX; i++) {
+		if (!tb[i] || i == NDA_LLADDR || i == NDA_SR6_SRH)
+			continue;
+		NL_SET_ERR_MSG_ATTR(extack, tb[i], "Unsupported sr6 FDB attribute");
+		return -EOPNOTSUPP;
+	}
+	return 0;
+}
+
+static int sr6_fdb_add(struct ndmsg *ndm, struct nlattr *tb[],
+		       struct net_device *dev, const unsigned char *addr,
+		       u16 vid, u16 flags, bool *notified,
+		       struct netlink_ext_ack *extack)
+{
+	struct sr6_priv *priv = netdev_priv(dev);
+	struct sr6_fdb *old, *fdb;
+	unsigned int max_mtu;
+	int err, srhlen;
+
+	ASSERT_RTNL();
+	err = sr6_fdb_validate(tb, addr, vid, extack);
+	if (err)
+		return err;
+	if (flags & NLM_F_APPEND || ndm->ndm_flags & ~NTF_SELF) {
+		NL_SET_ERR_MSG(extack, "Unsupported sr6 FDB flags");
+		return -EOPNOTSUPP;
+	}
+	if (!(ndm->ndm_state & (NUD_PERMANENT | NUD_REACHABLE)) ||
+	    ndm->ndm_state & ~(NUD_PERMANENT | NUD_REACHABLE | NUD_NOARP)) {
+		NL_SET_ERR_MSG(extack, "Only static FDB entries are supported");
+		return -EINVAL;
+	}
+	err = sr6_srh_validate(tb[NDA_SR6_SRH], extack);
+	if (err)
+		return err;
+
+	old = sr6_fdb_lookup(priv, addr);
+	if (old && flags & NLM_F_EXCL)
+		return -EEXIST;
+	if (!old && !(flags & NLM_F_CREATE))
+		return -ENOENT;
+	if (old && !(flags & NLM_F_REPLACE))
+		return -EEXIST;
+
+	srhlen = sr6_encap_srhlen(nla_data(tb[NDA_SR6_SRH]), priv->encap_mode);
+	max_mtu = IP_MAX_MTU - sizeof(struct ipv6hdr) - srhlen - ETH_HLEN;
+	if (dev->mtu > max_mtu) {
+		NL_SET_ERR_MSG(extack, "Device MTU is too large for this SRH");
+		return -EINVAL;
+	}
+
+	fdb = kzalloc(sizeof(*fdb), GFP_KERNEL);
+	if (!fdb)
+		return -ENOMEM;
+	fdb->remote.srh = nla_memdup(tb[NDA_SR6_SRH], GFP_KERNEL);
+	if (!fdb->remote.srh) {
+		err = -ENOMEM;
+		goto free;
+	}
+	err = dst_cache_init(&fdb->remote.dst_cache, GFP_KERNEL);
+	if (err)
+		goto free;
+	ether_addr_copy(fdb->addr, addr);
+	fdb->state = ndm->ndm_state;
+
+	if (old)
+		err = rhashtable_replace_fast(&priv->fdb, &old->rhnode,
+					      &fdb->rhnode, sr6_fdb_rht_params);
+	else
+		err = rhashtable_lookup_insert_fast(&priv->fdb, &fdb->rhnode,
+						    sr6_fdb_rht_params);
+	if (err)
+		goto free;
+
+	if (old) {
+		list_replace_rcu(&old->list, &fdb->list);
+		call_rcu(&old->rcu, sr6_fdb_free_rcu);
+	} else {
+		list_add_tail_rcu(&fdb->list, &priv->fdb_list);
+	}
+	/* Headroom is a hint: the encapsulation helpers expand each skb as
+	 * needed. Keep the maximum overhead after deleting a longer policy.
+	 */
+	WRITE_ONCE(dev->needed_headroom,
+		   max_t(unsigned int, dev->needed_headroom,
+			 LL_MAX_HEADER + sizeof(struct ipv6hdr) + srhlen));
+	dev->max_mtu = min(dev->max_mtu, max_mtu);
+	sr6_fdb_notify(dev, fdb, RTM_NEWNEIGH);
+	*notified = true;
+	return 0;
+free:
+	sr6_fdb_free(fdb);
+	return err;
+}
+
+static void sr6_fdb_remove(struct sr6_priv *priv, struct sr6_fdb *fdb)
+{
+	rhashtable_remove_fast(&priv->fdb, &fdb->rhnode, sr6_fdb_rht_params);
+	list_del_rcu(&fdb->list);
+	call_rcu(&fdb->rcu, sr6_fdb_free_rcu);
+}
+
+static int sr6_fdb_del(struct ndmsg *ndm, struct nlattr *tb[],
+		       struct net_device *dev, const unsigned char *addr,
+		       u16 vid, bool *notified, struct netlink_ext_ack *extack)
+{
+	struct sr6_priv *priv = netdev_priv(dev);
+	struct sr6_fdb *fdb;
+	int err;
+
+	ASSERT_RTNL();
+	err = sr6_fdb_validate(tb, addr, vid, extack);
+	if (err)
+		return err;
+	if (ndm->ndm_flags & ~NTF_SELF)
+		return -EOPNOTSUPP;
+	if (tb[NDA_SR6_SRH]) {
+		err = sr6_srh_validate(tb[NDA_SR6_SRH], extack);
+		if (err)
+			return err;
+	}
+	fdb = sr6_fdb_lookup(priv, addr);
+	if (!fdb)
+		return -ENOENT;
+	if (tb[NDA_SR6_SRH] &&
+	    (nla_len(tb[NDA_SR6_SRH]) != ipv6_optlen(fdb->remote.srh) ||
+	     memcmp(nla_data(tb[NDA_SR6_SRH]), fdb->remote.srh,
+		    ipv6_optlen(fdb->remote.srh))))
+		return -ENOENT;
+
+	sr6_fdb_notify(dev, fdb, RTM_DELNEIGH);
+	sr6_fdb_remove(priv, fdb);
+	*notified = true;
+	return 0;
+}
+
+static int sr6_fdb_dump(struct sk_buff *skb, struct netlink_callback *cb,
+			struct net_device *dev, struct net_device *filter_dev,
+			int *idx)
+{
+	struct ndo_fdb_dump_context *ctx = (void *)cb->ctx;
+	struct sr6_priv *priv = netdev_priv(dev);
+	struct sr6_fdb *fdb;
+	int err = 0;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(fdb, &priv->fdb_list, list) {
+		if (*idx >= ctx->fdb_idx) {
+			err = sr6_fdb_info(skb, dev, fdb,
+					   NETLINK_CB(cb->skb).portid,
+					   cb->nlh->nlmsg_seq, RTM_NEWNEIGH,
+					   NLM_F_MULTI);
+			if (err)
+				break;
+		}
+		++*idx;
+	}
+	rcu_read_unlock();
+	return err;
+}
+
+static int sr6_fdb_get(struct sk_buff *skb, struct nlattr *tb[],
+		       struct net_device *dev, const unsigned char *addr,
+		       u16 vid, u32 portid, u32 seq, struct netlink_ext_ack *extack)
+{
+	struct sr6_priv *priv = netdev_priv(dev);
+	struct sr6_fdb *fdb;
+	int err;
+
+	err = sr6_fdb_validate(tb, addr, vid, extack);
+	if (err)
+		return err;
+	rcu_read_lock();
+	fdb = sr6_fdb_lookup(priv, addr);
+	err = fdb ? sr6_fdb_info(skb, dev, fdb, portid, seq,
+				 RTM_NEWNEIGH, 0) : -ENOENT;
+	rcu_read_unlock();
+	return err;
 }
 
 /* Transmit an encapsulated frame and account for it.
@@ -272,15 +579,41 @@ free_skb:
 static netdev_tx_t sr6_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct sr6_priv *priv = netdev_priv(dev);
+	struct sr6_rdst *rdst = &priv->default_dst;
+	struct sr6_fdb *fdb;
 
-	return sr6_xmit_one(skb, dev, &priv->default_dst);
+	if (unlikely(!pskb_may_pull(skb, ETH_HLEN)))
+		goto drop;
+
+	rcu_read_lock();
+	fdb = sr6_fdb_lookup(priv, skb->data);
+	if (fdb)
+		rdst = &fdb->remote;
+	if (rdst->srh) {
+		sr6_xmit_one(skb, dev, rdst);
+		rcu_read_unlock();
+		return NETDEV_TX_OK;
+	}
+	rcu_read_unlock();
+drop:
+	DEV_STATS_INC(dev, tx_dropped);
+	kfree_skb(skb);
+	return NETDEV_TX_OK;
 }
 
 static int sr6_dev_init(struct net_device *dev)
 {
 	struct sr6_priv *priv = netdev_priv(dev);
+	int err;
 
-	return dst_cache_init(&priv->default_dst.dst_cache, GFP_KERNEL);
+	INIT_LIST_HEAD(&priv->fdb_list);
+	err = rhashtable_init(&priv->fdb, &sr6_fdb_rht_params);
+	if (err)
+		return err;
+	err = dst_cache_init(&priv->default_dst.dst_cache, GFP_KERNEL);
+	if (err)
+		rhashtable_destroy(&priv->fdb);
+	return err;
 }
 
 /* Free resources allocated in sr6_newlink(). Shared between the error path in
@@ -296,7 +629,11 @@ static void sr6_free_newlink_resources(struct sr6_priv *priv)
 static void sr6_dev_uninit(struct net_device *dev)
 {
 	struct sr6_priv *priv = netdev_priv(dev);
+	struct sr6_fdb *fdb, *tmp;
 
+	list_for_each_entry_safe(fdb, tmp, &priv->fdb_list, list)
+		sr6_fdb_remove(priv, fdb);
+	rhashtable_destroy(&priv->fdb);
 	dst_cache_destroy(&priv->default_dst.dst_cache);
 	sr6_free_newlink_resources(priv);
 }
@@ -305,6 +642,10 @@ static const struct net_device_ops sr6_netdev_ops = {
 	.ndo_init		= sr6_dev_init,
 	.ndo_uninit		= sr6_dev_uninit,
 	.ndo_start_xmit		= sr6_xmit,
+	.ndo_fdb_add		= sr6_fdb_add,
+	.ndo_fdb_del		= sr6_fdb_del,
+	.ndo_fdb_dump		= sr6_fdb_dump,
+	.ndo_fdb_get		= sr6_fdb_get,
 	.ndo_set_mac_address	= eth_mac_addr,
 	.ndo_validate_addr	= eth_validate_addr,
 };
@@ -341,15 +682,19 @@ static const struct nla_policy sr6_policy[IFLA_SR6_MAX + 1] = {
 static int sr6_validate(struct nlattr *tb[], struct nlattr *data[],
 			 struct netlink_ext_ack *extack)
 {
-	if (!data || !data[IFLA_SR6_SRH]) {
-		NL_SET_ERR_MSG(extack, "SRH with segment list is required");
-		return -EINVAL;
-	}
-
-	if (!data[IFLA_SR6_ENCAP_MODE]) {
+	if (!data || !data[IFLA_SR6_ENCAP_MODE]) {
 		NL_SET_ERR_MSG(extack, "Encapsulation mode is required");
 		return -EINVAL;
 	}
+
+	if (tb[IFLA_ADDRESS]) {
+		if (nla_len(tb[IFLA_ADDRESS]) != ETH_ALEN)
+			return -EINVAL;
+		if (!is_valid_ether_addr(nla_data(tb[IFLA_ADDRESS])))
+			return -EADDRNOTAVAIL;
+	}
+	if (data[IFLA_SR6_SRH])
+		return sr6_srh_validate(data[IFLA_SR6_SRH], extack);
 
 	return 0;
 }
@@ -391,35 +736,23 @@ static int sr6_newlink(struct net_device *dev,
 {
 	struct sr6_priv *priv = netdev_priv(dev);
 	struct nlattr **data = params->data;
-	struct ipv6_sr_hdr *srh;
-	int srhlen;
-	int err;
-	int len;
-
-	srh = nla_data(data[IFLA_SR6_SRH]);
-	len = nla_len(data[IFLA_SR6_SRH]);
-
-	if (len < sizeof(*srh) + sizeof(struct in6_addr)) {
-		NL_SET_ERR_MSG(extack, "SRH too short");
-		return -EINVAL;
-	}
-
-	/* Whatever the mode, userspace configures the full SID list and never
-	 * a reduced SRH.
-	 */
-	if (!seg6_validate_srh(srh, len, false)) {
-		NL_SET_ERR_MSG(extack, "Invalid SRH");
-		return -EINVAL;
-	}
-
-	priv->default_dst.srh = kmemdup(srh, len, GFP_KERNEL);
-	if (!priv->default_dst.srh)
-		return -ENOMEM;
+	int srhlen, err;
 
 	/* already validated by the nla policy */
 	priv->encap_mode = nla_get_u8(data[IFLA_SR6_ENCAP_MODE]);
 
-	srhlen = sr6_encap_srhlen(srh, priv->encap_mode);
+	/* Without a fallback, start with the overhead of a single SID.
+	 * FDB policies raise the headroom hint and lower max_mtu as needed.
+	 */
+	srhlen = priv->encap_mode == SR6_ENCAP_MODE_REDUCED ? 0 :
+		 sizeof(struct ipv6_sr_hdr) + sizeof(struct in6_addr);
+	if (data[IFLA_SR6_SRH]) {
+		/* Both modes take a full, validated SID list from userspace. */
+		priv->default_dst.srh = nla_memdup(data[IFLA_SR6_SRH], GFP_KERNEL);
+		if (!priv->default_dst.srh)
+			return -ENOMEM;
+		srhlen = sr6_encap_srhlen(priv->default_dst.srh, priv->encap_mode);
+	}
 
 	if (data[IFLA_SR6_FIB_TABLE]) {
 		priv->fib_table = nla_get_u32(data[IFLA_SR6_FIB_TABLE]);
@@ -455,9 +788,10 @@ static void sr6_dellink(struct net_device *dev, struct list_head *head)
 static size_t sr6_get_size(const struct net_device *dev)
 {
 	const struct sr6_priv *priv = netdev_priv(dev);
-	int srhlen = ipv6_optlen(priv->default_dst.srh);
+	size_t size = priv->default_dst.srh ?
+		nla_total_size(ipv6_optlen(priv->default_dst.srh)) : 0;
 
-	return nla_total_size(srhlen)	/* IFLA_SR6_SRH */
+	return size			/* IFLA_SR6_SRH */
 	       + nla_total_size(4)	/* IFLA_SR6_FIB_TABLE */
 	       + nla_total_size(1);	/* IFLA_SR6_ENCAP_MODE */
 }
@@ -465,9 +799,9 @@ static size_t sr6_get_size(const struct net_device *dev)
 static int sr6_fill_info(struct sk_buff *skb, const struct net_device *dev)
 {
 	const struct sr6_priv *priv = netdev_priv(dev);
-	int srhlen = ipv6_optlen(priv->default_dst.srh);
+	struct ipv6_sr_hdr *srh = priv->default_dst.srh;
 
-	if (nla_put(skb, IFLA_SR6_SRH, srhlen, priv->default_dst.srh))
+	if (srh && nla_put(skb, IFLA_SR6_SRH, ipv6_optlen(srh), srh))
 		return -EMSGSIZE;
 
 	if (priv->fib_table &&
@@ -497,12 +831,17 @@ static int sr6_reset_dst_cache(struct net_device *dev,
 			       struct netdev_nested_priv *priv)
 {
 	struct sr6_priv *sp;
+	struct sr6_fdb *fdb;
 
 	if (!netif_is_sr6(dev))
 		return 0;
 
 	sp = netdev_priv(dev);
 	dst_cache_reset(&sp->default_dst.dst_cache);
+	rcu_read_lock();
+	list_for_each_entry_rcu(fdb, &sp->fdb_list, list)
+		dst_cache_reset(&fdb->remote.dst_cache);
+	rcu_read_unlock();
 
 	return 0;
 }
@@ -553,6 +892,8 @@ static void __exit sr6_exit(void)
 {
 	rtnl_link_unregister(&sr6_link_ops);
 	unregister_netdevice_notifier(&sr6_notifier_block);
+	/* FDB callbacks execute module code and may outlive the netdevice. */
+	rcu_barrier();
 }
 
 module_init(sr6_init);

@@ -19216,10 +19216,13 @@ M:	Andrea Mayer <andrea.mayer@uniroma2.it>
 L:	netdev@vger.kernel.org
 S:	Maintained
 T:	git git://git.kernel.org/pub/scm/linux/kernel/git/netdev/net.git
+F:	Documentation/networking/sr6.rst
 F:	include/linux/seg6*
 F:	include/net/seg6*
+F:	include/net/sr6.h
 F:	include/uapi/linux/seg6*
 F:	net/ipv6/seg6*
+F:	net/ipv6/sr6.c
 F:	tools/testing/selftests/net/srv6*
 
 NETWORKING [TCP]
