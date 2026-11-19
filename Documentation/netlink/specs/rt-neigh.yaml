@@ -267,6 +267,10 @@ attribute-sets:
       -
         name: table
         type: u32
+      -
+        name: old-remote
+        type: nest
+        nested-attributes: sr6-attrs
   -
     name: ndt-attrs
     name-prefix: ndta-
