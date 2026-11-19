@@ -37,9 +37,12 @@
  */
 #define SR6_SRH_HEADROOM_EST	256
 
-struct sr6_config {
+/* An SRv6 policy toward one remote PE. Immutable once published: a change
+ * replaces the whole remote, so a reader never pairs a cached route with a
+ * different SID list, mode or table.
+ */
+struct sr6_remote {
 	struct ipv6_sr_hdr	*srh;
-	/* replaced with the configuration, so it never holds a stale route */
 	struct dst_cache	dst_cache;
 	u32			fib_table;
 	u8			encap_mode;
@@ -47,7 +50,7 @@ struct sr6_config {
 };
 
 struct sr6_priv {
-	struct sr6_config __rcu	*config;
+	struct sr6_remote __rcu	*remote;
 };
 
 /* SRH length for the given encapsulation mode. The full mode keeps the
@@ -68,73 +71,71 @@ static int sr6_encap_srhlen(const struct ipv6_sr_hdr *srh, u8 encap_mode)
 	return srh->first_segment ? srhlen - sizeof(struct in6_addr) : srhlen;
 }
 
-static struct sr6_config *sr6_config_alloc(void)
+static struct sr6_remote *sr6_remote_alloc(void)
 {
-	struct sr6_config *cfg;
+	struct sr6_remote *rd;
 	int err;
 
-	cfg = kzalloc_obj(*cfg);
-	if (!cfg)
+	rd = kzalloc_obj(*rd);
+	if (!rd)
 		return ERR_PTR(-ENOMEM);
 
-	err = dst_cache_init(&cfg->dst_cache, GFP_KERNEL);
+	err = dst_cache_init(&rd->dst_cache, GFP_KERNEL);
 	if (err) {
-		kfree(cfg);
+		kfree(rd);
 		return ERR_PTR(err);
 	}
 
-	return cfg;
+	return rd;
 }
 
-static void sr6_config_free(struct sr6_config *cfg)
+static void sr6_remote_free(struct sr6_remote *rd)
 {
-	if (cfg) {
-		dst_cache_destroy(&cfg->dst_cache);
-		kfree(cfg->srh);
-		kfree(cfg);
+	if (rd) {
+		dst_cache_destroy(&rd->dst_cache);
+		kfree(rd->srh);
+		kfree(rd);
 	}
 }
 
-static void sr6_config_free_rcu(struct rcu_head *head)
+static void sr6_remote_free_rcu(struct rcu_head *head)
 {
-	struct sr6_config *cfg = container_of(head, struct sr6_config, rcu);
-
-	sr6_config_free(cfg);
+	sr6_remote_free(container_of(head, struct sr6_remote, rcu));
 }
 
-static struct sr6_config *sr6_config_rtnl(const struct net_device *dev)
+static struct sr6_remote *sr6_remote_rtnl(const struct net_device *dev)
 {
 	const struct sr6_priv *priv = netdev_priv(dev);
 
-	return rtnl_dereference(priv->config);
+	return rtnl_dereference(priv->remote);
 }
 
-static struct sr6_config *sr6_config_rcu(const struct net_device *dev)
+static struct sr6_remote *sr6_remote_rcu(const struct net_device *dev)
 {
 	const struct sr6_priv *priv = netdev_priv(dev);
 
-	return rcu_dereference(priv->config);
+	return rcu_dereference(priv->remote);
 }
 
-/* Release the configuration of a device that is going away. Reached through
+/* Release the remote of a device that is going away. Reached through
  * priv_destructor and, explicitly, when the registration fails, so it has to
  * be safe against running twice.
  */
 static void sr6_free_dev(struct net_device *dev)
 {
-	struct sr6_config *cfg;
+	struct sr6_remote *rd;
 	struct sr6_priv *priv;
 
 	priv = netdev_priv(dev);
 
 	/* RTNL is held when the registration fails and is not held when the
 	 * device is destroyed, so no single lock can be asserted here. On
-	 * either path priv->config has no reader left.
+	 * either path priv->remote has no reader left.
 	 */
-	cfg = rcu_dereference_protected(priv->config, 1);
+	rd = rcu_dereference_protected(priv->remote, 1);
 
-	sr6_config_free(cfg);
-	RCU_INIT_POINTER(priv->config, NULL);
+	sr6_remote_free(rd);
+	RCU_INIT_POINTER(priv->remote, NULL);
 }
 
 /* Transmit an encapsulated frame and account for it.
@@ -191,22 +192,22 @@ static struct dst_entry *sr6_table_lookup(struct net *net, u32 tbl_id,
 	return &rt->dst;
 }
 
-/* Resolve the route to the first SID, through the configured FIB table or, when
- * none is set, through the VRF context inherited from the device hierarchy.
- * Mirrors seg6_output_dst_lookup() in seg6_iptunnel.c.
+/* Resolve the route to the first SID, through the FIB table of the remote or,
+ * when none is set, through the VRF context inherited from the device
+ * hierarchy. Mirrors seg6_output_dst_lookup() in seg6_iptunnel.c.
  *
  * Always returns a dst with a refcount held. A failure is reported through
  * dst->error, never as NULL.
  */
 static struct dst_entry *sr6_dst_lookup(struct net *net,
 					struct net_device *dev,
-					const struct sr6_config *cfg,
+					const struct sr6_remote *rd,
 					struct flowi6 *fl6)
 {
 	struct dst_entry *dst;
 
-	if (cfg->fib_table) {
-		dst = sr6_table_lookup(net, cfg->fib_table, fl6);
+	if (rd->fib_table) {
+		dst = sr6_table_lookup(net, rd->fib_table, fl6);
 		if (!dst) {
 			dst = &net->ipv6.ip6_blk_hole_entry->dst;
 			dst_hold(dst);
@@ -233,7 +234,7 @@ static struct dst_entry *sr6_dst_lookup(struct net *net,
  * when there is no route.
  */
 static struct dst_entry *sr6_route_lookup(struct net_device *dev,
-					  struct sr6_config *cfg)
+					  struct sr6_remote *rd)
 {
 	struct dst_entry *dst;
 	struct flowi6 fl6;
@@ -241,17 +242,17 @@ static struct dst_entry *sr6_route_lookup(struct net_device *dev,
 	int err;
 
 	local_bh_disable();
-	dst = dst_cache_get(&cfg->dst_cache);
+	dst = dst_cache_get(&rd->dst_cache);
 	local_bh_enable();
 
 	if (likely(dst))
 		return dst;
 
 	memset(&fl6, 0, sizeof(fl6));
-	fl6.daddr = cfg->srh->segments[cfg->srh->first_segment];
+	fl6.daddr = rd->srh->segments[rd->srh->first_segment];
 
 	net = dev_net(dev);
-	dst = sr6_dst_lookup(net, dev, cfg, &fl6);
+	dst = sr6_dst_lookup(net, dev, rd, &fl6);
 	if (dst->error) {
 		err = dst->error;
 		goto release_dst;
@@ -263,7 +264,7 @@ static struct dst_entry *sr6_route_lookup(struct net_device *dev,
 	}
 
 	local_bh_disable();
-	dst_cache_set_ip6(&cfg->dst_cache, dst, &fl6.saddr);
+	dst_cache_set_ip6(&rd->dst_cache, dst, &fl6.saddr);
 	local_bh_enable();
 
 	return dst;
@@ -273,35 +274,19 @@ release_dst:
 	return ERR_PTR(err);
 }
 
-/* Encapsulate an L2 frame in IPv6+SRH and transmit.
- *
- * When the bridge (or local stack) sends a frame through this device,
- * skb->data points to its Ethernet header.
+/* Encapsulate an L2 frame in IPv6+SRH toward one remote and transmit it.
+ * Consumes the skb. skb->data points to the Ethernet header.
  */
-static netdev_tx_t sr6_xmit(struct sk_buff *skb, struct net_device *dev)
+static void sr6_xmit_one(struct sk_buff *skb, struct net_device *dev,
+			 struct sr6_remote *rd)
 {
 	enum skb_drop_reason reason;
-	struct sr6_config *cfg;
 	struct dst_entry *dst;
 	int pkt_len;
 	int err;
 
-	/* seg6_do_srh_encap() and seg6_do_srh_encap_red() read the traffic
-	 * class, the flow label and the hop limit of an inner IPv6 header,
-	 * which may not be in the linear area yet.
-	 */
-	reason = pskb_inet_may_pull_reason(skb);
-	if (unlikely(reason))
-		goto drop;
-
-	rcu_read_lock();
-
-	cfg = sr6_config_rcu(dev);
-
-	dst = sr6_route_lookup(dev, cfg);
-	if (unlikely(IS_ERR(dst))) {
-		rcu_read_unlock();
-
+	dst = sr6_route_lookup(dev, rd);
+	if (IS_ERR(dst)) {
 		/* -ELOOP and -ENETUNREACH have a dedicated counter. Every other
 		 * error, such as a missing FIB table, takes tx_errors alone.
 		 */
@@ -322,12 +307,10 @@ static netdev_tx_t sr6_xmit(struct sk_buff *skb, struct net_device *dev)
 	/* inner L2 frame size, before encap adds IPv6+SRH overhead */
 	pkt_len = skb->len;
 
-	if (cfg->encap_mode == SR6_ENCAP_MODE_REDUCED)
-		err = seg6_do_srh_encap_red(skb, cfg->srh, IPPROTO_ETHERNET);
+	if (rd->encap_mode == SR6_ENCAP_MODE_REDUCED)
+		err = seg6_do_srh_encap_red(skb, rd->srh, IPPROTO_ETHERNET);
 	else
-		err = seg6_do_srh_encap(skb, cfg->srh, IPPROTO_ETHERNET);
-
-	rcu_read_unlock();
+		err = seg6_do_srh_encap(skb, rd->srh, IPPROTO_ETHERNET);
 
 	if (unlikely(err)) {
 		DEV_STATS_INC(dev, tx_errors);
@@ -340,12 +323,31 @@ static netdev_tx_t sr6_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	sr6_tunnel_xmit(skb, dev, pkt_len);
 
-	return NETDEV_TX_OK;
+	return;
 
-drop:
-	DEV_STATS_INC(dev, tx_dropped);
 free_skb:
 	kfree_skb_reason(skb, reason);
+}
+
+static netdev_tx_t sr6_xmit(struct sk_buff *skb, struct net_device *dev)
+{
+	enum skb_drop_reason reason;
+
+	/* seg6_do_srh_encap() and seg6_do_srh_encap_red() read the traffic
+	 * class, the flow label and the hop limit of an inner IPv6 header,
+	 * which may not be in the linear area yet.
+	 */
+	reason = pskb_inet_may_pull_reason(skb);
+	if (unlikely(reason)) {
+		DEV_STATS_INC(dev, tx_dropped);
+		kfree_skb_reason(skb, reason);
+		return NETDEV_TX_OK;
+	}
+
+	rcu_read_lock();
+	sr6_xmit_one(skb, dev, sr6_remote_rcu(dev));
+	rcu_read_unlock();
+
 	return NETDEV_TX_OK;
 }
 
@@ -408,8 +410,8 @@ static int sr6_validate(struct nlattr *tb[], struct nlattr *data[],
 		return -EINVAL;
 	}
 
-	/* The mode and the FIB table are checked by sr6_nl2config(), which
-	 * receives old_cfg, NULL on a creation, and so can require the mode on
+	/* The mode and the FIB table are checked by sr6_nl2remote(), which
+	 * receives old_rd, NULL on a creation, and so can require the mode on
 	 * a creation and accept a new one afterwards.
 	 */
 	return 0;
@@ -418,7 +420,7 @@ static int sr6_validate(struct nlattr *tb[], struct nlattr *data[],
 /* Whatever the mode, userspace configures the full SID list and never a
  * reduced SRH.
  */
-static int sr6_nl2srh(struct nlattr *data[], struct sr6_config *new_cfg,
+static int sr6_nl2srh(struct nlattr *data[], struct sr6_remote *new_rd,
 		      struct netlink_ext_ack *extack)
 {
 	struct ipv6_sr_hdr *srh;
@@ -438,82 +440,82 @@ static int sr6_nl2srh(struct nlattr *data[], struct sr6_config *new_cfg,
 		return -EINVAL;
 	}
 
-	new_cfg->srh = kmemdup(srh, len, GFP_KERNEL);
-	if (!new_cfg->srh)
+	new_rd->srh = kmemdup(srh, len, GFP_KERNEL);
+	if (!new_rd->srh)
 		return -ENOMEM;
 
 	return 0;
 }
 
-static int sr6_nl2encap_mode(struct nlattr *data[], struct sr6_config *new_cfg,
-			     const struct sr6_config *old_cfg,
+static int sr6_nl2encap_mode(struct nlattr *data[], struct sr6_remote *new_rd,
+			     const struct sr6_remote *old_rd,
 			     struct netlink_ext_ack *extack)
 {
 	if (!data[IFLA_SR6_ENCAP_MODE]) {
-		if (!old_cfg) {
+		if (!old_rd) {
 			NL_SET_ERR_MSG(extack,
 				       "Encapsulation mode is required");
 			return -EINVAL;
 		}
 
-		new_cfg->encap_mode = old_cfg->encap_mode;
+		new_rd->encap_mode = old_rd->encap_mode;
 
 		return 0;
 	}
 
 	/* already validated by the nla policy */
-	new_cfg->encap_mode = nla_get_u8(data[IFLA_SR6_ENCAP_MODE]);
+	new_rd->encap_mode = nla_get_u8(data[IFLA_SR6_ENCAP_MODE]);
 
 	return 0;
 }
 
-static int sr6_nl2fib_table(struct nlattr *data[], struct sr6_config *new_cfg,
-			    const struct sr6_config *old_cfg,
+static int sr6_nl2fib_table(struct nlattr *data[], struct sr6_remote *new_rd,
+			    const struct sr6_remote *old_rd,
 			    struct netlink_ext_ack *extack)
 {
 	u32 fib_table;
 
 	if (!data[IFLA_SR6_FIB_TABLE]) {
-		if (old_cfg)
-			new_cfg->fib_table = old_cfg->fib_table;
+		if (old_rd)
+			new_rd->fib_table = old_rd->fib_table;
 
 		return 0;
 	}
 
 	fib_table = nla_get_u32(data[IFLA_SR6_FIB_TABLE]);
-	if (old_cfg && fib_table != old_cfg->fib_table) {
+	if (old_rd && fib_table != old_rd->fib_table) {
 		NL_SET_ERR_MSG_ATTR(extack, data[IFLA_SR6_FIB_TABLE],
 				    "Cannot change the FIB table");
 		return -EOPNOTSUPP;
 	}
 
-	if (!old_cfg && !fib_table) {
+	if (!old_rd && !fib_table) {
 		NL_SET_ERR_MSG_ATTR(extack, data[IFLA_SR6_FIB_TABLE],
 				    "Invalid FIB table ID");
 		return -EINVAL;
 	}
 
-	new_cfg->fib_table = fib_table;
+	new_rd->fib_table = fib_table;
 
 	return 0;
 }
 
-static int sr6_nl2config(struct nlattr *data[],
-			 struct sr6_config *new_cfg,
-			 const struct sr6_config *old_cfg,
+static int sr6_nl2remote(struct nlattr *data[],
+			 struct sr6_remote *new_rd,
+			 const struct sr6_remote *old_rd,
 			 struct netlink_ext_ack *extack)
 {
 	int err;
 
-	err = sr6_nl2encap_mode(data, new_cfg, old_cfg, extack);
+	err = sr6_nl2encap_mode(data, new_rd, old_rd, extack);
 	if (err)
 		return err;
 
-	err = sr6_nl2fib_table(data, new_cfg, old_cfg, extack);
+	err = sr6_nl2fib_table(data, new_rd, old_rd, extack);
 	if (err)
 		return err;
 
-	return sr6_nl2srh(data, new_cfg, extack);
+	return sr6_nl2srh(data, new_rd, extack);
 }
 
 static int sr6_encap_overhead(int srhlen)
@@ -623,15 +625,15 @@ refuse:
 	return -EINVAL;
 }
 
-static int sr6_config2dev(struct net_device *dev, struct nlattr *tb[],
-			  const struct sr6_config *new_cfg,
-			  const struct sr6_config *old_cfg,
+static int sr6_remote2dev(struct net_device *dev, struct nlattr *tb[],
+			  const struct sr6_remote *new_rd,
+			  const struct sr6_remote *old_rd,
 			  struct netlink_ext_ack *extack)
 {
-	int new_srhlen = sr6_encap_srhlen(new_cfg->srh, new_cfg->encap_mode);
+	int new_srhlen = sr6_encap_srhlen(new_rd->srh, new_rd->encap_mode);
 	int err;
 
-	if (old_cfg)
+	if (old_rd)
 		err = sr6_set_mtu_changelink(dev, tb, new_srhlen, extack);
 	else
 		err = sr6_set_mtu_newlink(dev, tb, new_srhlen, extack);
@@ -645,51 +647,51 @@ static int sr6_config2dev(struct net_device *dev, struct nlattr *tb[],
 	return 0;
 }
 
-/* store the new configuration on the device and release the previous one */
-static int sr6_config_apply(struct net_device *dev, struct nlattr *tb[],
-			    struct sr6_config *new_cfg,
-			    struct sr6_config *old_cfg,
+/* store the new remote on the device and release the previous one */
+static int sr6_remote_apply(struct net_device *dev, struct nlattr *tb[],
+			    struct sr6_remote *new_rd,
+			    struct sr6_remote *old_rd,
 			    struct netlink_ext_ack *extack)
 {
 	struct sr6_priv *priv;
 	int err;
 
-	err = sr6_config2dev(dev, tb, new_cfg, old_cfg, extack);
+	err = sr6_remote2dev(dev, tb, new_rd, old_rd, extack);
 	if (err)
 		return err;
 
 	priv = netdev_priv(dev);
-	rcu_assign_pointer(priv->config, new_cfg);
+	rcu_assign_pointer(priv->remote, new_rd);
 
-	if (old_cfg)
-		call_rcu_hurry(&old_cfg->rcu, sr6_config_free_rcu);
+	if (old_rd)
+		call_rcu_hurry(&old_rd->rcu, sr6_remote_free_rcu);
 
 	return 0;
 }
 
 static int sr6_configure(struct net_device *dev, struct nlattr *tb[],
-			 struct nlattr *data[], struct sr6_config *old_cfg,
+			 struct nlattr *data[], struct sr6_remote *old_rd,
 			 struct netlink_ext_ack *extack)
 {
-	struct sr6_config *cfg;
+	struct sr6_remote *rd;
 	int err;
 
-	cfg = sr6_config_alloc();
-	if (IS_ERR(cfg))
-		return PTR_ERR(cfg);
+	rd = sr6_remote_alloc();
+	if (IS_ERR(rd))
+		return PTR_ERR(rd);
 
-	err = sr6_nl2config(data, cfg, old_cfg, extack);
+	err = sr6_nl2remote(data, rd, old_rd, extack);
 	if (err)
-		goto free_cfg;
+		goto free_rd;
 
-	err = sr6_config_apply(dev, tb, cfg, old_cfg, extack);
+	err = sr6_remote_apply(dev, tb, rd, old_rd, extack);
 	if (err)
-		goto free_cfg;
+		goto free_rd;
 
 	return 0;
 
-free_cfg:
-	sr6_config_free(cfg);
+free_rd:
+	sr6_remote_free(rd);
 	return err;
 }
 
@@ -714,9 +716,9 @@ static int sr6_changelink(struct net_device *dev, struct nlattr *tb[],
 			  struct nlattr *data[],
 			  struct netlink_ext_ack *extack)
 {
-	struct sr6_config *old_cfg = sr6_config_rtnl(dev);
+	struct sr6_remote *old_rd = sr6_remote_rtnl(dev);
 
-	return sr6_configure(dev, tb, data, old_cfg, extack);
+	return sr6_configure(dev, tb, data, old_rd, extack);
 }
 
 static void sr6_dellink(struct net_device *dev, struct list_head *head)
@@ -726,15 +728,15 @@ static void sr6_dellink(struct net_device *dev, struct list_head *head)
 
 static size_t sr6_get_size(const struct net_device *dev)
 {
-	const struct sr6_config *cfg;
+	const struct sr6_remote *rd;
 	size_t srh_size = 0;
 	int srhlen;
 
 	rcu_read_lock();
 
-	cfg = sr6_config_rcu(dev);
-	if (cfg) {
-		srhlen = ipv6_optlen(cfg->srh);
+	rd = sr6_remote_rcu(dev);
+	if (rd) {
+		srhlen = ipv6_optlen(rd->srh);
 		srh_size = nla_total_size(srhlen);
 	}
 
@@ -747,27 +749,27 @@ static size_t sr6_get_size(const struct net_device *dev)
 
 static int sr6_fill_info(struct sk_buff *skb, const struct net_device *dev)
 {
-	const struct sr6_config *cfg;
+	const struct sr6_remote *rd;
 	int err = 0;
 	int srhlen;
 
 	rcu_read_lock();
 
-	cfg = sr6_config_rcu(dev);
-	if (!cfg) {
+	rd = sr6_remote_rcu(dev);
+	if (!rd) {
 		err = -ENODEV;
 		goto out;
 	}
 
-	srhlen = ipv6_optlen(cfg->srh);
-	if (nla_put(skb, IFLA_SR6_SRH, srhlen, cfg->srh))
+	srhlen = ipv6_optlen(rd->srh);
+	if (nla_put(skb, IFLA_SR6_SRH, srhlen, rd->srh))
 		goto nla_put_failure;
 
-	if (cfg->fib_table &&
-	    nla_put_u32(skb, IFLA_SR6_FIB_TABLE, cfg->fib_table))
+	if (rd->fib_table &&
+	    nla_put_u32(skb, IFLA_SR6_FIB_TABLE, rd->fib_table))
 		goto nla_put_failure;
 
-	if (nla_put_u8(skb, IFLA_SR6_ENCAP_MODE, cfg->encap_mode))
+	if (nla_put_u8(skb, IFLA_SR6_ENCAP_MODE, rd->encap_mode))
 		goto nla_put_failure;
 
 out:
@@ -797,13 +799,13 @@ static struct rtnl_link_ops sr6_link_ops __read_mostly = {
 static int sr6_reset_dst_cache(struct net_device *dev,
 			       struct netdev_nested_priv *priv)
 {
-	struct sr6_config *cfg;
+	struct sr6_remote *rd;
 
 	if (!netif_is_sr6(dev))
 		return 0;
 
-	cfg = sr6_config_rtnl(dev);
-	dst_cache_reset(&cfg->dst_cache);
+	rd = sr6_remote_rtnl(dev);
+	dst_cache_reset(&rd->dst_cache);
 
 	return 0;
 }
@@ -858,7 +860,7 @@ static void __exit sr6_exit(void)
 	rtnl_link_unregister(&sr6_link_ops);
 	unregister_netdevice_notifier(&sr6_notifier_block);
 
-	/* Wait for the sr6_config_free_rcu() callbacks a changelink may have
+	/* Wait for the sr6_remote_free_rcu() callbacks a changelink may have
 	 * left queued: their code goes away with the module, and a grace
 	 * period does not wait for a callback to run.
 	 */
