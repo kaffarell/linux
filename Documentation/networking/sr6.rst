@@ -8,7 +8,8 @@ The sr6 device is a virtual Ethernet tunnel device that encapsulates L2
 frames in IPv6 with a Segment Routing Header (SRH) for transmission over
 an SRv6 network. It is designed for use with a remote seg6local L2
 decapsulation behavior such as End.DT2U or End.DX2, providing
-point-to-point L2 VPN services over an IPv6 backbone.
+point-to-point and statically configured multipoint L2 VPN services over
+an IPv6 backbone.
 
 The End.DT2U and End.DX2 behaviors are defined in RFC 8986 (SRv6 Network
 Programming).
@@ -85,6 +86,97 @@ ARP, and other L2 protocols. The hosts are unaware of the encapsulation.
 The underlay is the IPv6 operator network that interconnects the PE
 routers and carries the SRv6-encapsulated traffic.
 
+Forwarding database
+~~~~~~~~~~~~~~~~~~~
+
+The device keeps every SRv6 policy in its forwarding database (FDB). A
+policy describes one remote PE: the SRH with its full segment list, the
+encapsulation mode and an optional FIB table. Each one has its own route
+cache. There is no other device-wide forwarding state.
+
+The FDB is keyed by destination MAC::
+
+    00:00:00:00:00:00 -> [remote X, remote Y]
+    00:11:22:33:44:55 -> [remote Z]
+
+A unicast MAC has exactly one remote. The all-zeros entry can hold several.
+A frame uses the entry of its destination MAC or, if there is none, the
+all-zeros entry, and is sent to every remote of that entry. Without either,
+it is dropped and counted in tx_dropped. An exact match is never retried
+through the all-zeros entry, not even when its route lookup fails.
+
+Broadcast, multicast and unknown unicast frames therefore reach every
+remote of the all-zeros entry. There is no learning, ageing, VLAN key or
+per-group multicast entry. Remote MACs are installed by userspace. The
+receive side is unchanged: End.DT2U delivers to the bridge, which learns
+the MAC of the inner source on the sr6 port.
+
+A remote is identified within its entry by its SRH and its table. The
+same SID list can thus appear twice in one entry, with different tables.
+The mode is policy data and does not take part in the identity.
+
+``ip link`` configures the all-zeros entry: creating a device with
+``segs`` installs its only remote, and changing it replaces that remote.
+A mode or table left out of an ``ip link`` change is kept from the
+remote it replaces. When the all-zeros entry has several remotes,
+``ip link`` refuses the change, since it cannot tell which one to
+replace. The link reports the policy of the all-zeros entry as long as
+it has a single remote; ``bridge fdb`` shows every policy.
+
+FDB netlink interface
+~~~~~~~~~~~~~~~~~~~~~
+
+Use RTM_NEWNEIGH, RTM_DELNEIGH and RTM_GETNEIGH with AF_BRIDGE, the sr6
+ifindex and NTF_SELF. NDA_LLADDR carries a unicast or the all-zeros MAC.
+NDA_SR6 is a nested attribute that carries the policy:
+
+ * NDA_SR6_SRH: the ``struct ipv6_sr_hdr`` and the full segment array, in
+   the same layout as IFLA_SR6_SRH. Both modes take the full list; the
+   reduced encoding is done at transmit time.
+ * NDA_SR6_MODE: ``enum sr6_encap_mode``. Omitted means full.
+ * NDA_SR6_TABLE: FIB table for the route to the first SID. Omitted or
+   zero means the routing context inherited from the device.
+ * NDA_SR6_OLD_REMOTE: nested NDA_SR6_SRH and NDA_SR6_TABLE that select
+   the remote to replace.
+
+An FDB request describes a complete policy: an omitted mode or table
+takes its default and is not copied from the remote being replaced.
+Replacing a remote without a table therefore clears its table. This
+differs from ``ip link``, which keeps them.
+
+The operations are:
+
+ * NLM_F_CREATE adds an entry. With NLM_F_EXCL, an existing entry is an
+   error.
+ * NLM_F_APPEND adds a remote to the all-zeros entry, creating it with
+   NLM_F_CREATE.
+ * NLM_F_REPLACE replaces the remote of an entry that has only one.
+   With NDA_SR6_OLD_REMOTE, it replaces the selected remote of the
+   all-zeros entry. It cannot be combined with NLM_F_APPEND.
+ * RTM_DELNEIGH with an NDA_SR6 selector removes that remote, and without
+   one removes the whole entry. A selector must carry the table when it
+   targets a remote with an explicit table.
+ * RTM_DELNEIGH with NLM_F_BULK flushes the FDB. NDA_NDM_STATE_MASK
+   restricts the flush to entries whose masked state matches ndm_state.
+ * RTM_GETNEIGH returns the first remote of an entry. A dump returns one
+   message per remote.
+
+Each added, replaced or removed remote is reported to RTNLGRP_NEIGH,
+including changes made through ``ip link`` and device removal. A
+replacement that keeps the identity is reported as RTM_NEWNEIGH only;
+one that changes it first reports the old remote as removed.
+
+Entries require NUD_PERMANENT or NUD_REACHABLE, optionally with NUD_NOARP.
+Adding, appending or replacing a remote sets the state of its entry.
+Other neighbor flags and attributes and VLAN keys are refused.
+
+This is a proposed UAPI; ``tools/testing/selftests/net/sr6_fdb.py`` uses
+raw rtnetlink and does not depend on iproute2 support for it.
+
+Writers are serialized by RTNL. Transmit reads the FDB under RCU, and an
+update publishes a complete new remote before the old one is freed after a
+grace period.
+
 Encapsulation mode
 ~~~~~~~~~~~~~~~~~~
 
@@ -105,9 +197,9 @@ device takes that option in reduced mode only. The Ethernet frame then
 becomes the payload of a plain outer IPv6 packet, with no SRH and the
 next header set to 143.
 
-The mode is mandatory and has no default, so a device is always created
-with it stated explicitly. A later change can leave it out, and then the
-device keeps the mode it has.
+The mode belongs to each remote, so remotes with different modes can share
+a device. An FDB request that leaves it out uses the full mode, and an
+``ip link`` change keeps the mode the remote has.
 
 Post-encap SID route lookup
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -123,13 +215,16 @@ it inherits the VRF routing context and resolves the encapsulated
 packet through the VRF table. SID reachability routes must be present
 in that table.
 
-Alternatively, sr6 can be created with a table parameter that specifies
-a FIB table for direct lookup, bypassing fib rules entirely. This is
+Alternatively, a policy can carry a table parameter that specifies a
+FIB table for direct lookup, bypassing fib rules entirely. This is
 useful when SID routes live in a dedicated table separate from host
-routes.
+routes. The table belongs to each remote, and a table of zero is the
+same as no table.
 
 The two mechanisms can be combined: if a table parameter is set and sr6
 is also in a VRF, the explicit table parameter takes precedence.
+Changes of the device's master hierarchy reset the route cache of every
+remote.
 
 In summary, four configurations are possible::
 
@@ -208,24 +303,33 @@ A long segment list drives the MTU down. Below the IPv6 minimum of 1280,
 IPv6 does not come up on the device, while IPv4 keeps working, and the
 computed default never goes under the Ethernet minimum of 68.
 
-The MTU is computed again whenever the configuration changes. The
-overhead depends on the SRH that is pushed, and the segment list, the
-TLVs it carries and the mode all change its size. An MTU given in the
-same command is used instead, so a user who wants to keep one has to
+The maximum MTU and the needed headroom follow the largest encoded
+overhead among all the remotes in the FDB, and are recomputed after every
+FDB change. A device created without a remote starts with the default MTU
+for a single SID in the full mode.
+
+An FDB update never changes the current MTU. A remote whose overhead does
+not fit the current MTU within the maximum outer packet size is refused;
+lower the MTU first.
+
+``ip link`` changes recompute the MTU as the default for the largest
+overhead among the new policy and the remaining remotes. An MTU given in
+the same command is used instead, so a user who wants to keep one has to
 pass it again::
 
-    ip link set dev sr6-0 mtu 9000 type sr6 segs fc00:3::e,fc00:2::d20
+    ip link set dev sr6-0 mtu 9000 type sr6 mode full \
+        segs fc00:3::e,fc00:2::d20
 
-A longer list means a larger overhead and therefore a lower maximum
-MTU. An MTU above that maximum is refused.
+The needed headroom is only a hint: the encapsulation expands each skb as
+its remote requires. Configure the MTU for the smallest underlay path MTU
+and the largest overhead among the remotes, since the End.DT2U receive
+path does not reassemble outer fragments.
 
 Limitations
 ~~~~~~~~~~~
 
-The segment list and the encapsulation mode can be replaced on a live
-device, without recreating it. The FIB table is immutable after
-creation: to change it, the device must be deleted and recreated. The
-device also cannot be moved between network namespaces.
+Remotes can be added, replaced and removed on a live device, without
+recreating it. The device cannot be moved between network namespaces.
 
 Usage
 -----
@@ -255,8 +359,6 @@ Usage
 
     ip link add sr6-0 type sr6 mode full segs fc00:2::d20 table 200
 
-   The table parameter must be non-zero.
-
 5. Create an sr6 device whose SRH carries an HMAC TLV::
 
     ip link add sr6-0 type sr6 mode full segs fc00:2::d20 hmac 1
@@ -265,46 +367,45 @@ Usage
    device cannot transmit until it is configured with ``ip sr hmac``.
    The TLV adds 40 bytes to the SRH, and therefore to the overhead.
 
-6. Replace the segment list of an existing device::
+6. Replace the policy of an existing device::
 
-    ip link set dev sr6-0 type sr6 segs fc00:3::e,fc00:2::d20
+    ip link set dev sr6-0 type sr6 mode full segs fc00:3::e,fc00:2::d20
 
-   The device keeps forwarding while the list is replaced, and the new
-   list need not have the same length as the old one.
+   The command replaces the only remote of the all-zeros FDB entry, or
+   creates it. The device keeps forwarding while the policy is replaced,
+   and the new list need not have the same length as the old one.
 
-   The encapsulation mode can be replaced in the same way. The segment
-   list is required in every command, so it is passed again with the
-   new mode::
-
-    ip link set dev sr6-0 type sr6 mode reduced \
-        segs fc00:3::e,fc00:2::d20
-
-   The command builds a new segment list inside a new SRH, with an
-   HMAC TLV when ``hmac`` is given, and this SRH replaces the one the
-   device had. A device configured with an HMAC TLV carries one after
-   the change only if ``hmac`` is passed again::
+   The mode and the table keep their value when the command leaves them
+   out, and ``table 0`` returns to the inherited routing context. The
+   command builds a new SRH, so an HMAC TLV is carried only when
+   ``hmac`` is passed again::
 
     ip link set dev sr6-0 type sr6 segs fc00:3::e,fc00:2::d20 hmac 1
 
-   The encapsulation mode and the FIB table are not part of the SRH.
-   They keep their value when the command leaves them out, and a FIB
-   table different from the one configured is refused.
+7. Create an sr6 device with no remote and add remotes through the FDB.
+   The commands below use the proposed ``bridge fdb`` syntax of iproute2::
 
-7. Show sr6 device details::
+    ip link add sr6-0 type sr6
+    bridge fdb add 00:00:00:00:00:00 dev sr6-0 self permanent \
+        segs fc00:2::d20
+    bridge fdb append 00:00:00:00:00:00 dev sr6-0 self permanent \
+        segs fc00:3::d20 mode reduced
+    bridge fdb add 02:00:00:00:00:02 dev sr6-0 self permanent \
+        segs fc00:2::d20 table 200
 
-    ip -d link show sr6-0
-    8: sr6-0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1422 ...
-        link/ether ...
-        sr6 mode full segs fc00:2::d20
+   Broadcast, multicast and unknown unicast frames go to both PEs of the
+   all-zeros entry, while frames to 02:00:00:00:00:02 go to the PE behind
+   fc00:2::d20 through table 200.
 
-   When a table is configured, it appears in the output::
+8. Show the remotes::
 
-    ip -d link show sr6-0
-    8: sr6-0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1422 ...
-        link/ether ...
-        sr6 mode full segs fc00:2::d20 table 200
+    bridge fdb show dev sr6-0
 
-8. Delete an sr6 device::
+   ``ip -d link show`` reports the policy of the all-zeros entry while
+   it has a single remote, as for a device configured with ``ip link``
+   only.
+
+9. Delete an sr6 device::
 
     ip link delete sr6-0
 
@@ -387,12 +488,10 @@ If the bridge is later removed from the VRF, subsequent packets are
 routed through the main table again.
 
 The table parameter can be used together with a VRF. In that case the
-explicit table takes precedence for the post-encap SID route lookup.
-Since the table cannot be added later, the device is created with it,
-in place of the creation shown above::
+explicit table takes precedence for the post-encap SID route lookup::
 
     # sr6 uses table 200 regardless of the VRF
-    ip link add sr6-0 type sr6 mode full segs fcff:2::d20 table 200
+    ip link set sr6-0 type sr6 mode full segs fcff:2::d20 table 200
 
 Integrated Routing and Bridging (IRB)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
