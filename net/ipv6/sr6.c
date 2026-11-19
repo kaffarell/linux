@@ -15,7 +15,7 @@
  *
  *  Each remote PE is described by an SRv6 policy held in the device FDB. The
  *  FDB maps a destination MAC to one remote, and the all-zeros MAC to the
- *  remote that receives every other frame. ip link configures the all-zeros
+ *  remotes that receive every other frame. ip link configures the all-zeros
  *  entry through the same code as the FDB interface.
  *
  *  Authors:
@@ -60,8 +60,8 @@ struct sr6_remote {
 	struct rcu_head		rcu;
 };
 
-/* An FDB entry and its remote. A list, so that an entry can later hold
- * more than one.
+/* An FDB entry. A unicast MAC has exactly one remote. The all-zeros entry
+ * has one or more, and a frame selecting it is replicated to each of them.
  */
 struct sr6_fdb {
 	struct hlist_node	hlist;
@@ -185,9 +185,18 @@ static bool sr6_remote_match(const struct sr6_remote *rd,
 	       !memcmp(rd->srh, sel->srh, len);
 }
 
-static struct sr6_remote *sr6_fdb_first(struct sr6_fdb *fdb)
+static struct sr6_remote *sr6_remote_find(struct sr6_fdb *fdb,
+					  const struct sr6_policy *sel)
 {
-	return list_first_or_null_rcu(&fdb->remotes, struct sr6_remote, list);
+	struct sr6_remote *rd;
+
+	list_for_each_entry_rcu(rd, &fdb->remotes, list,
+				lockdep_rtnl_is_held()) {
+		if (sr6_remote_match(rd, sel))
+			return rd;
+	}
+
+	return NULL;
 }
 
 static size_t sr6_fdb_nlmsg_size(const struct sr6_remote *rd)
@@ -385,15 +394,22 @@ static int sr6_fdb_install(struct net_device *dev, struct sr6_fdb *fdb,
 	return 0;
 }
 
-/* Add or replace the remote of an entry. Mode and table are part of the
- * policy and replaced along with the SRH. They are never inherited from the
- * remote being replaced.
+/* Add or replace a remote.
+ *
+ * A unicast MAC has a single remote, which NLM_F_REPLACE replaces. The
+ * all-zeros entry accepts more with NLM_F_APPEND. Replacing one of its remotes
+ * takes the old one as a selector, unless the entry has only one.
+ *
+ * Mode and table are part of the policy and replaced along with the SRH. They
+ * are never inherited from the remote being replaced.
  */
 static int sr6_fdb_update(struct net_device *dev, const u8 *addr, u16 state,
 			  u16 flags, const struct sr6_policy *pol,
+			  const struct sr6_policy *old_sel,
 			  struct netlink_ext_ack *extack)
 {
 	struct sr6_priv *priv = netdev_priv(dev);
+	struct sr6_remote *old = NULL;
 	struct sr6_fdb *fdb;
 	int err;
 
@@ -403,10 +419,20 @@ static int sr6_fdb_update(struct net_device *dev, const u8 *addr, u16 state,
 	if (err)
 		return err;
 
+	if (flags & NLM_F_APPEND && !is_zero_ether_addr(addr)) {
+		NL_SET_ERR_MSG(extack,
+			       "Only the all-zeros entry can hold more than one remote");
+		return -EINVAL;
+	}
+
 	fdb = sr6_fdb_find(priv, addr);
 	if (!fdb) {
 		if (!(flags & NLM_F_CREATE)) {
 			NL_SET_ERR_MSG(extack, "FDB entry not found");
+			return -ENOENT;
+		}
+		if (old_sel) {
+			NL_SET_ERR_MSG(extack, "Remote to replace not found");
 			return -ENOENT;
 		}
 
@@ -424,13 +450,48 @@ static int sr6_fdb_update(struct net_device *dev, const u8 *addr, u16 state,
 		goto out;
 	}
 
-	if (flags & NLM_F_EXCL || !(flags & NLM_F_REPLACE)) {
+	if (flags & NLM_F_EXCL) {
 		NL_SET_ERR_MSG(extack, "FDB entry already exists");
 		return -EEXIST;
 	}
 
+	if (flags & NLM_F_APPEND) {
+		if (sr6_remote_find(fdb, pol)) {
+			NL_SET_ERR_MSG(extack, "Remote already exists");
+			return -EEXIST;
+		}
+
+		err = sr6_fdb_install(dev, fdb, NULL, pol);
+		goto out;
+	}
+
+	if (!(flags & NLM_F_REPLACE)) {
+		NL_SET_ERR_MSG(extack, "FDB entry already exists");
+		return -EEXIST;
+	}
+
+	if (old_sel) {
+		old = sr6_remote_find(fdb, old_sel);
+		if (!old) {
+			NL_SET_ERR_MSG(extack, "Remote to replace not found");
+			return -ENOENT;
+		}
+	} else if (list_is_singular(&fdb->remotes)) {
+		old = list_first_entry(&fdb->remotes, struct sr6_remote, list);
+	} else {
+		NL_SET_ERR_MSG(extack,
+			       "Entry has several remotes, select the one to replace");
+		return -EINVAL;
+	}
+
+	/* The new identity must not collide with another remote. */
+	if (!sr6_remote_match(old, pol) && sr6_remote_find(fdb, pol)) {
+		NL_SET_ERR_MSG(extack, "Remote already exists");
+		return -EEXIST;
+	}
+
 	WRITE_ONCE(fdb->state, state);
-	err = sr6_fdb_install(dev, fdb, sr6_fdb_first(fdb), pol);
+	err = sr6_fdb_install(dev, fdb, old, pol);
 
 out:
 	if (!err)
@@ -439,8 +500,8 @@ out:
 	return err;
 }
 
-/* A delete selector identifies a remote by SRH and table. It may repeat the
- * mode of the remote, which is ignored.
+/* A selector identifies a remote by SRH and table. It may repeat the mode of
+ * the remote, which is ignored.
  */
 static const struct nla_policy sr6_sel_policy[NDA_SR6_MAX + 1] = {
 	[NDA_SR6_SRH]		= NLA_POLICY_MIN_LEN(sizeof(struct ipv6_sr_hdr) +
@@ -454,6 +515,7 @@ static const struct nla_policy sr6_fdb_policy[NDA_SR6_MAX + 1] = {
 						     sizeof(struct in6_addr)),
 	[NDA_SR6_MODE]		= NLA_POLICY_MAX(NLA_U8, SR6_ENCAP_MODE_MAX),
 	[NDA_SR6_TABLE]		= { .type = NLA_U32 },
+	[NDA_SR6_OLD_REMOTE]	= NLA_POLICY_NESTED(sr6_sel_policy),
 };
 
 /* Whatever the mode, userspace configures the full SID list and never a
@@ -493,11 +555,18 @@ static int sr6_parse_policy(struct nlattr *srh, struct nlattr *mode,
 	return sr6_parse_srh(srh, pol, extack);
 }
 
+/* Parse NDA_SR6 into the policy, and NDA_SR6_OLD_REMOTE, when present, into
+ * the selector of the remote to replace.
+ */
 static int sr6_fdb_parse(struct nlattr *tb[], struct sr6_policy *pol,
+			 struct sr6_policy *old_sel, bool *has_old,
 			 struct netlink_ext_ack *extack)
 {
 	struct nlattr *sr6[NDA_SR6_MAX + 1];
+	struct nlattr *old[NDA_SR6_MAX + 1];
 	int err;
+
+	*has_old = false;
 
 	if (!tb[NDA_SR6]) {
 		NL_SET_ERR_MSG(extack, "sr6 policy is required");
@@ -509,8 +578,27 @@ static int sr6_fdb_parse(struct nlattr *tb[], struct sr6_policy *pol,
 	if (err)
 		return err;
 
-	return sr6_parse_policy(sr6[NDA_SR6_SRH], sr6[NDA_SR6_MODE],
-				sr6[NDA_SR6_TABLE], pol, extack);
+	err = sr6_parse_policy(sr6[NDA_SR6_SRH], sr6[NDA_SR6_MODE],
+			       sr6[NDA_SR6_TABLE], pol, extack);
+	if (err)
+		return err;
+
+	if (!sr6[NDA_SR6_OLD_REMOTE])
+		return 0;
+
+	err = nla_parse_nested(old, NDA_SR6_MAX, sr6[NDA_SR6_OLD_REMOTE],
+			       sr6_sel_policy, extack);
+	if (err)
+		return err;
+
+	err = sr6_parse_policy(old[NDA_SR6_SRH], NULL, old[NDA_SR6_TABLE],
+			       old_sel, extack);
+	if (err)
+		return err;
+
+	*has_old = true;
+
+	return 0;
 }
 
 /* Parse the optional selector of a delete or get request. */
@@ -571,7 +659,8 @@ static int sr6_fdb_add(struct ndmsg *ndm, struct nlattr *tb[],
 		       u16 vid, u16 flags, bool *notified,
 		       struct netlink_ext_ack *extack)
 {
-	struct sr6_policy pol;
+	struct sr6_policy pol, old_sel;
+	bool has_old;
 	int err;
 
 	ASSERT_RTNL();
@@ -580,7 +669,7 @@ static int sr6_fdb_add(struct ndmsg *ndm, struct nlattr *tb[],
 	if (err)
 		return err;
 
-	if (flags & NLM_F_APPEND || ndm->ndm_flags & ~NTF_SELF) {
+	if (ndm->ndm_flags & ~NTF_SELF) {
 		NL_SET_ERR_MSG(extack, "Unsupported sr6 FDB flags");
 		return -EOPNOTSUPP;
 	}
@@ -591,11 +680,18 @@ static int sr6_fdb_add(struct ndmsg *ndm, struct nlattr *tb[],
 		return -EINVAL;
 	}
 
-	err = sr6_fdb_parse(tb, &pol, extack);
+	err = sr6_fdb_parse(tb, &pol, &old_sel, &has_old, extack);
 	if (err)
 		return err;
 
-	err = sr6_fdb_update(dev, addr, ndm->ndm_state, flags, &pol, extack);
+	if (has_old && (flags & (NLM_F_REPLACE | NLM_F_APPEND)) !=
+		       NLM_F_REPLACE) {
+		NL_SET_ERR_MSG(extack, "Old remote selector requires NLM_F_REPLACE");
+		return -EINVAL;
+	}
+
+	err = sr6_fdb_update(dev, addr, ndm->ndm_state, flags, &pol,
+			     has_old ? &old_sel : NULL, extack);
 	if (!err)
 		*notified = true;
 
@@ -607,6 +703,7 @@ static int sr6_fdb_del(struct ndmsg *ndm, struct nlattr *tb[],
 		       u16 vid, bool *notified, struct netlink_ext_ack *extack)
 {
 	struct sr6_priv *priv = netdev_priv(dev);
+	struct sr6_remote *rd;
 	struct sr6_policy sel;
 	struct sr6_fdb *fdb;
 	bool has_sel;
@@ -629,10 +726,22 @@ static int sr6_fdb_del(struct ndmsg *ndm, struct nlattr *tb[],
 	if (!fdb)
 		return -ENOENT;
 
-	if (has_sel && !sr6_remote_match(sr6_fdb_first(fdb), &sel))
+	if (!has_sel || list_is_singular(&fdb->remotes)) {
+		if (has_sel && !sr6_remote_find(fdb, &sel))
+			return -ENOENT;
+		sr6_fdb_destroy(dev, fdb);
+		goto out;
+	}
+
+	rd = sr6_remote_find(fdb, &sel);
+	if (!rd)
 		return -ENOENT;
 
-	sr6_fdb_destroy(dev, fdb);
+	list_del_rcu(&rd->list);
+	sr6_fdb_notify(dev, fdb, rd, RTM_DELNEIGH);
+	call_rcu(&rd->rcu, sr6_remote_free_rcu);
+
+out:
 	sr6_fdb_update_limits(dev);
 	*notified = true;
 	return 0;
@@ -696,7 +805,9 @@ static int sr6_fdb_del_bulk(struct nlmsghdr *nlh, struct net_device *dev,
 	return 0;
 }
 
-/* One message per remote. The index counts remotes rather than entries. */
+/* One message per remote. The index counts remotes, so a dump resumed from a
+ * later skb continues inside a multi-remote entry.
+ */
 static int sr6_fdb_dump(struct sk_buff *skb, struct netlink_callback *cb,
 			struct net_device *dev, struct net_device *filter_dev,
 			int *idx)
@@ -728,7 +839,9 @@ out:
 	return err;
 }
 
-/* A get request carries a single MAC and returns its remote. */
+/* A get request carries a single MAC and selects its first remote. The
+ * all-zeros entry may hold more, which a dump reports.
+ */
 static int sr6_fdb_get(struct sk_buff *skb, struct nlattr *tb[],
 		       struct net_device *dev, const unsigned char *addr,
 		       u16 vid, u32 portid, u32 seq,
@@ -745,7 +858,8 @@ static int sr6_fdb_get(struct sk_buff *skb, struct nlattr *tb[],
 
 	rcu_read_lock();
 	fdb = sr6_fdb_find(priv, addr);
-	rd = fdb ? sr6_fdb_first(fdb) : NULL;
+	rd = fdb ? list_first_or_null_rcu(&fdb->remotes, struct sr6_remote,
+					  list) : NULL;
 	err = rd ? sr6_fdb_info(skb, dev, fdb, rd, portid, seq,
 				RTM_NEWNEIGH, 0) : -ENOENT;
 	rcu_read_unlock();
@@ -945,17 +1059,23 @@ free_skb:
 }
 
 /* Select the FDB entry by destination MAC, falling back to the all-zeros
- * entry, and send the frame to its remote.
+ * entry, and send the frame to each of its remotes.
  *
  * An exact match never falls back, even when its route lookup fails: that
  * would send the frame along a policy that userspace did not select for it.
+ *
+ * Every remote but the last gets a clone. The clones share the packet data,
+ * which the encapsulation never writes in place: seg6_do_srh_encap() and
+ * seg6_do_srh_encap_red() call skb_cow_head() before pushing the outer
+ * headers, and that unshares a cloned head.
  */
 static netdev_tx_t sr6_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct sr6_priv *priv = netdev_priv(dev);
+	struct sr6_remote *rd, *prev = NULL;
 	enum skb_drop_reason reason;
-	struct sr6_remote *rd;
 	struct sr6_fdb *fdb;
+	struct sk_buff *nskb;
 
 	/* seg6_do_srh_encap() and seg6_do_srh_encap_red() read the traffic
 	 * class, the flow label and the hop limit of an inner IPv6 header,
@@ -976,15 +1096,31 @@ static netdev_tx_t sr6_xmit(struct sk_buff *skb, struct net_device *dev)
 	if (!fdb)
 		fdb = sr6_fdb_find(priv, sr6_zero_mac);
 
-	/* Empty only while a concurrent delete is unlinking the entry. */
-	rd = fdb ? sr6_fdb_first(fdb) : NULL;
-	if (unlikely(!rd)) {
+	if (unlikely(!fdb)) {
 		rcu_read_unlock();
 		reason = SKB_DROP_REASON_NO_TX_TARGET;
 		goto drop;
 	}
 
-	sr6_xmit_one(skb, dev, rd);
+	list_for_each_entry_rcu(rd, &fdb->remotes, list) {
+		if (prev) {
+			nskb = skb_clone(skb, GFP_ATOMIC);
+			if (likely(nskb))
+				sr6_xmit_one(nskb, dev, prev);
+			else
+				DEV_STATS_INC(dev, tx_dropped);
+		}
+		prev = rd;
+	}
+
+	/* Empty only while a concurrent delete is unlinking the entry. */
+	if (unlikely(!prev)) {
+		rcu_read_unlock();
+		reason = SKB_DROP_REASON_NO_TX_TARGET;
+		goto drop;
+	}
+
+	sr6_xmit_one(skb, dev, prev);
 
 	rcu_read_unlock();
 
@@ -1160,7 +1296,7 @@ static int sr6_newlink(struct net_device *dev,
 		goto unregister;
 
 	err = sr6_fdb_update(dev, sr6_zero_mac, NUD_NOARP | NUD_PERMANENT,
-			     NLM_F_CREATE | NLM_F_EXCL, &pol, extack);
+			     NLM_F_CREATE | NLM_F_EXCL, &pol, NULL, extack);
 	if (err)
 		goto unregister;
 
@@ -1171,7 +1307,9 @@ unregister:
 	return err;
 }
 
-/* Create the all-zeros entry or replace its remote.
+/* Create the all-zeros entry or replace its sole remote. With more than one
+ * remote the target is ambiguous, and the FDB interface, which takes the old
+ * remote as a selector, has to be used instead.
  *
  * Unlike an FDB update, a link change may carry an MTU. Without one, the MTU
  * is recomputed as the default for the largest overhead among the remotes
@@ -1198,8 +1336,14 @@ static int sr6_changelink(struct net_device *dev, struct nlattr *tb[],
 		return err;
 
 	fdb = sr6_fdb_find(priv, sr6_zero_mac);
-	if (fdb)
-		old = sr6_fdb_first(fdb);
+	if (fdb) {
+		if (!list_is_singular(&fdb->remotes)) {
+			NL_SET_ERR_MSG(extack,
+				       "Several remotes are installed, use the FDB to replace one");
+			return -EINVAL;
+		}
+		old = list_first_entry(&fdb->remotes, struct sr6_remote, list);
+	}
 
 	srhlen = max(sr6_fdb_max_srhlen(priv, old),
 		     sr6_encap_srhlen(pol.srh, pol.mode));
@@ -1220,7 +1364,7 @@ static int sr6_changelink(struct net_device *dev, struct nlattr *tb[],
 		goto restore;
 
 	err = sr6_fdb_update(dev, sr6_zero_mac, NUD_NOARP | NUD_PERMANENT,
-			     NLM_F_CREATE | NLM_F_REPLACE, &pol, extack);
+			     NLM_F_CREATE | NLM_F_REPLACE, &pol, NULL, extack);
 	if (err)
 		goto restore;
 

@@ -233,6 +233,7 @@ enum {
 	NDA_SR6_SRH,		/* binary: struct ipv6_sr_hdr, full SID list */
 	NDA_SR6_MODE,		/* u8: enum sr6_encap_mode */
 	NDA_SR6_TABLE,		/* u32: FIB table, 0 for the device context */
+	NDA_SR6_OLD_REMOTE,	/* nested, NDA_SR6_SRH and NDA_SR6_TABLE */
 	__NDA_SR6_MAX
 };
 #define NDA_SR6_MAX (__NDA_SR6_MAX - 1)
