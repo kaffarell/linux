@@ -34,6 +34,7 @@ enum {
 	NDA_FLAGS_EXT,
 	NDA_NDM_STATE_MASK,
 	NDA_NDM_FLAGS_MASK,
+	NDA_SR6,	/* nested, NDA_SR6_* */
 	__NDA_MAX
 };
 
@@ -225,5 +226,15 @@ enum {
 	__NFEA_MAX
 };
 #define NFEA_MAX (__NFEA_MAX - 1)
+
+/* SRv6 policy of an sr6 FDB remote, nested in NDA_SR6. */
+enum {
+	NDA_SR6_UNSPEC,
+	NDA_SR6_SRH,		/* binary: struct ipv6_sr_hdr, full SID list */
+	NDA_SR6_MODE,		/* u8: enum sr6_encap_mode */
+	NDA_SR6_TABLE,		/* u32: FIB table, 0 for the device context */
+	__NDA_SR6_MAX
+};
+#define NDA_SR6_MAX (__NDA_SR6_MAX - 1)
 
 #endif

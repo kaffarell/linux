@@ -246,6 +246,27 @@ attribute-sets:
       -
         name: ndm-flags-mask
         type: u8
+      -
+        name: sr6
+        type: nest
+        nested-attributes: sr6-attrs
+  -
+    name: sr6-attrs
+    name-prefix: nda-sr6-
+    attributes:
+      -
+        name: unspec
+        type: unused
+        value: 0
+      -
+        name: srh
+        type: binary
+      -
+        name: mode
+        type: u8
+      -
+        name: table
+        type: u32
   -
     name: ndt-attrs
     name-prefix: ndta-
@@ -370,6 +391,7 @@ operations:
             - nh-id
             - flags-ext
             - fdb-ext-attrs
+            - sr6
     -
       name: delneigh
       doc: Remove an existing neighbour entry

@@ -1136,12 +1136,12 @@ device_creation_error_tests()
 	! ip -netns "${tns}" link add sr6-bad type sr6 mode full 2>/dev/null
 	log_test $? 0 "Reject sr6 without segs"
 
-	! ip -netns "${tns}" link add sr6-bad type sr6 segs fc00::1 2>/dev/null
-	log_test $? 0 "Reject sr6 without encap mode"
+	# Devices without a policy, and policies with omitted mode, are tested
+	# via raw rtnetlink in sr6_fdb.py: iproute2 may still require them.
 
-	! ip -netns "${tns}" link add sr6-bad type sr6 mode full \
-		segs fc00::1 table 0 2>/dev/null
-	log_test $? 0 "Reject sr6 with fib_table=0"
+	ip -netns "${tns}" link add sr6-t0 type sr6 mode full \
+		segs fc00::1 table 0
+	log_test $? 0 "Accept sr6 with fib_table=0 for the inherited context"
 
 	! ip -netns "${tns}" link add sr6-bad mtu 65500 type sr6 mode full \
 		segs fc00::1 2>/dev/null
@@ -1206,8 +1206,11 @@ sr6_changelink_tests()
 
 	nsname=$(nsname_rt 1)
 
+	# A link change replaces the whole policy of the all-zeros FDB entry,
+	# so a mode left out is the full one, not the previous one.
 	segs="$(sr6_segs 3 2)"
-	ip -netns "${nsname}" link set "${SR6_DEVNAME}" type sr6 segs "${segs}"
+	ip -netns "${nsname}" link set "${SR6_DEVNAME}" type sr6 \
+		mode reduced segs "${segs}"
 	log_test $? 0 "rt-1: replace the segment list on a live device"
 
 	mtu="$(get_mtu "${nsname}" "${SR6_DEVNAME}")"
@@ -1236,12 +1239,19 @@ sr6_changelink_tests()
 	log_test "${mtu}" "$(sr6_expected_mtu reduced 2)" \
 		"rt-1: the MTU follows the mode back"
 
-	! ip -netns "${nsname}" link set "${SR6_DEVNAME}" type sr6 \
-		table "${SR6_FIB_TABLE_ID}" segs "${segs}" 2>/dev/null
-	log_test $? 0 "rt-1: reject a different FIB table"
+	# rt-1 has no route in the dedicated table, so the policy that
+	# selects it cannot reach rt-2, while the one that omits the table
+	# returns to the main table.
+	ip -netns "${nsname}" link set "${SR6_DEVNAME}" type sr6 \
+		mode reduced segs "${segs}" table "${SR6_FIB_TABLE_ID}"
+	log_test $? 0 "rt-1: change the FIB table on a live device"
+
+	check_hs_ipv6_connectivity 1 2
+	log_test $? 1 "IPv6 through the empty FIB table: hs-1 -X-> hs-2"
 
 	segs="$(sr6_segs "" 2)"
-	ip -netns "${nsname}" link set "${SR6_DEVNAME}" type sr6 segs "${segs}"
+	ip -netns "${nsname}" link set "${SR6_DEVNAME}" type sr6 \
+		mode reduced segs "${segs}"
 	log_test $? 0 "rt-1: replace it back with a shorter list"
 
 	mtu="$(get_mtu "${nsname}" "${SR6_DEVNAME}")"
@@ -1252,14 +1262,15 @@ sr6_changelink_tests()
 	log_test $? 0 "IPv6 after the shorter list: hs-1 -> hs-2"
 
 	ip -netns "${nsname}" link set "${SR6_DEVNAME}" mtu "${IPV6_MIN_MTU}" \
-		type sr6 segs "${segs}"
+		type sr6 mode reduced segs "${segs}"
 	log_test $? 0 "rt-1: replace the list and set the MTU in one command"
 
 	mtu="$(get_mtu "${nsname}" "${SR6_DEVNAME}")"
 	log_test "${mtu}" "${IPV6_MIN_MTU}" \
 		"rt-1: the MTU given in the command is kept"
 
-	ip -netns "${nsname}" link set "${SR6_DEVNAME}" type sr6 segs "${segs}"
+	ip -netns "${nsname}" link set "${SR6_DEVNAME}" type sr6 \
+		mode reduced segs "${segs}"
 	log_test $? 0 "rt-1: replace the list again without an MTU"
 
 	mtu="$(get_mtu "${nsname}" "${SR6_DEVNAME}")"
